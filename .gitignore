@@ -1,0 +1,37 @@
+# --- Claude Code mod ---
+# Type declarations the engine re-lays on every load/reload of the mod.
+# claude-code-mcp/ inside it lists the MCP servers connected on this machine.
+# The mod's own contract, types/index.d.ts at the mod root, stays tracked.
+**/.claude-plugin/types/
+
+# --- Claude Code (local) ---
+# Machine-local settings and permission allowlists; a shared .claude/settings.json stays tracked.
+.claude/*.local.json
+CLAUDE.local.md
+
+# Local session history / memory produced by plugins
+.remember/
+.gbrain/
+
+# --- Secrets & environment ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# --- Node / TypeScript tooling ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+*.log
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
