@@ -62,15 +62,15 @@ const ASKING_TOOLS = new Set([QUESTION_TOOL, PLAN_APPROVAL_TOOL])
 
 const NO_READING = '—'
 
-const NOT_MEASURED = '측정 전'
+const NOT_MEASURED = 'not measured yet'
 
-export const SUBAGENTS_LABEL = '서브에이전트'
+export const SUBAGENTS_LABEL = 'subagents'
 
-export const TEAMMATES_LABEL = '팀메이트'
+export const TEAMMATES_LABEL = 'teammates'
 
-export const BACKGROUND_LABEL = '백그라운드'
+export const BACKGROUND_LABEL = 'background'
 
-export const RUNNING_TEXT = '실행 중'
+export const RUNNING_TEXT = 'running'
 
 const ACTIVE_AGENT_STATUSES = new Set<DashAgentStatus>(['pending', 'running', 'waiting'])
 
@@ -106,8 +106,8 @@ const PACE_MIN_ELAPSED_MS = new Map([
 ])
 
 const LIMIT_LABELS = new Map([
-  [FIVE_HOUR_LIMIT, '5시간'],
-  [SEVEN_DAY_LIMIT, '주간'],
+  [FIVE_HOUR_LIMIT, '5-hour'],
+  [SEVEN_DAY_LIMIT, 'Weekly'],
 ])
 
 export const BAND_LIMIT_KINDS = [FIVE_HOUR_LIMIT, SEVEN_DAY_LIMIT]
@@ -389,8 +389,8 @@ function worseOf(a: Severity, b: Severity): Severity {
   return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b
 }
 
-// Hangul, CJK and fullwidth forms take two terminal cells; everything this
-// mod draws besides them takes one.
+// Hangul, CJK and fullwidth forms take two terminal cells (task and agent
+// descriptions can hold them); everything else this mod draws takes one.
 function isWide(codePoint: number): boolean {
   return (
     (codePoint >= 0x1100 && codePoint <= 0x115f) ||
@@ -515,10 +515,10 @@ function formatAgo(ms: number): string {
   const minutes = Math.floor(ms / (MS_PER_SECOND * SECONDS_PER_MINUTE))
 
   if (minutes < 1) {
-    return '방금'
+    return 'just now'
   }
 
-  return minutes < MINUTES_PER_HOUR ? `${minutes}m 전` : `${formatDuration(ms)} 전`
+  return minutes < MINUTES_PER_HOUR ? `${minutes}m ago` : `${formatDuration(ms)} ago`
 }
 
 function contextMeter(usage: DashUsage | null): MeterView {
@@ -529,11 +529,11 @@ function contextMeter(usage: DashUsage | null): MeterView {
 
   return {
     key: CONTEXT_METER_KEY,
-    label: '컨텍스트',
+    label: 'Context',
     isAvailable: true,
     leftPercent,
     severity: usedPercent === null ? 'ok' : severityOf(usedPercent),
-    valueText: leftPercent === null ? NOT_MEASURED : `${Math.floor(leftPercent)}% 남음`,
+    valueText: leftPercent === null ? NOT_MEASURED : `${Math.floor(leftPercent)}% left`,
     noteText: `${tokensText} / ${windowText}`,
   }
 }
@@ -548,7 +548,7 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
       isAvailable: !hasResponse,
       leftPercent: null,
       severity: 'ok',
-      valueText: hasResponse ? '정보 없음' : NOT_MEASURED,
+      valueText: hasResponse ? 'no data' : NOT_MEASURED,
       noteText: '',
     }
   }
@@ -562,14 +562,14 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
       isAvailable: true,
       leftPercent: null,
       severity: 'ok',
-      valueText: '리셋됨',
-      noteText: '다음 응답에 갱신',
+      valueText: 'reset',
+      noteText: 'updates on next reply',
     }
   }
 
   const leftPercent = Math.max(0, PERCENT_FULL - limit.percentUsed)
   const exhaustsIn = exhaustsBeforeReset(limit, now)
-  const resetNote = limit.resetsAt === null ? '' : `${formatDuration(limit.resetsAt - now)} 후 리셋`
+  const resetNote = limit.resetsAt === null ? '' : `resets in ${formatDuration(limit.resetsAt - now)}`
 
   return {
     key: kind,
@@ -577,8 +577,8 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
     isAvailable: true,
     leftPercent,
     severity: exhaustsIn === null ? severityOf(limit.percentUsed) : worseOf(severityOf(limit.percentUsed), 'warn'),
-    valueText: `${Math.floor(leftPercent)}% 남음`,
-    noteText: exhaustsIn === null ? resetNote : `이 속도면 ${formatDuration(exhaustsIn)} 후 소진`,
+    valueText: `${Math.floor(leftPercent)}% left`,
+    noteText: exhaustsIn === null ? resetNote : `runs out in ${formatDuration(exhaustsIn)} at this pace`,
   }
 }
 
@@ -628,7 +628,7 @@ function limitsNoteOf(usage: DashUsage | null, hasResponse: boolean): string | n
     return null
   }
 
-  return hasResponse ? '응답에 한도 정보가 없습니다. API 키로 쓰는 중이면 정상입니다.' : null
+  return hasResponse ? 'Responses carry no rate-limit data; expected when using an API key.' : null
 }
 
 function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
@@ -647,13 +647,13 @@ function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
 }
 
 const AGENT_STATUS_TEXT: Record<DashAgentStatus, string> = {
-  pending: '시작 중',
+  pending: 'starting',
   running: RUNNING_TEXT,
-  waiting: '멈춤',
-  idle: '유휴',
-  completed: '완료',
-  failed: '실패',
-  killed: '중지됨',
+  waiting: 'paused',
+  idle: 'idle',
+  completed: 'done',
+  failed: 'failed',
+  killed: 'stopped',
 }
 
 function agentView(agent: DashAgent, now: number): WorkerView {
@@ -688,17 +688,17 @@ function callsDetail(calls: readonly DashCall[]): string {
   const first = calls[0]
 
   if (first === undefined) {
-    return '생각 중'
+    return 'thinking'
   }
 
-  return calls.length === 1 ? `${first.tool} 실행 중` : `${first.tool} 외 ${calls.length - 1}개 실행 중`
+  return calls.length === 1 ? `${first.tool} ${RUNNING_TEXT}` : `${first.tool} +${calls.length - 1} ${RUNNING_TEXT}`
 }
 
 const TURN_END_TITLES: Record<DashTurnEnd['reason'], { phase: Phase; title: string }> = {
-  answer: { phase: 'done', title: '전체 완료' },
-  aborted: { phase: 'interrupted', title: '중단됨' },
-  refusal: { phase: 'error', title: '응답 거부됨' },
-  error: { phase: 'error', title: '오류로 종료' },
+  answer: { phase: 'done', title: 'All done' },
+  aborted: { phase: 'interrupted', title: 'Interrupted' },
+  refusal: { phase: 'error', title: 'Refused' },
+  error: { phase: 'error', title: 'Ended with an error' },
 }
 
 type WorkerCounts = Pick<DashView, 'activeSubagents' | 'activeTeammates' | 'tasks'>
@@ -718,7 +718,7 @@ function waitingTitle(workers: WorkerCounts): string | null {
     }
   }
 
-  return names.length === 0 ? null : `${names.join(', ')} 대기`
+  return names.length === 0 ? null : `Waiting on ${names.join(', ')}`
 }
 
 function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
@@ -728,8 +728,8 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   if (ask !== undefined) {
     return {
       phase: 'needs-input',
-      title: '입력 필요',
-      detail: ask.tool === PLAN_APPROVAL_TOOL ? '계획 승인' : '질문',
+      title: 'Needs you',
+      detail: ask.tool === PLAN_APPROVAL_TOOL ? 'plan approval' : 'question',
       elapsedText: formatDuration(now - ask.startedAt),
     }
   }
@@ -737,7 +737,7 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   if (snapshot.isWorking) {
     return {
       phase: 'working',
-      title: '응답 중',
+      title: 'Working',
       detail: callsDetail(snapshot.turn?.calls ?? []),
       elapsedText: '',
     }
@@ -755,7 +755,7 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   }
 
   if (snapshot.lastTurn === null) {
-    return { phase: 'ready', title: '준비됨', detail: '', elapsedText: '' }
+    return { phase: 'ready', title: 'Ready', detail: '', elapsedText: '' }
   }
 
   const end = TURN_END_TITLES[snapshot.lastTurn.reason]
@@ -763,7 +763,7 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   return {
     phase: end.phase,
     title: end.title,
-    detail: `${formatAgo(now - snapshot.lastTurn.endedAt)} · ${formatDuration(snapshot.lastTurn.durationMs)} 소요`,
+    detail: `${formatAgo(now - snapshot.lastTurn.endedAt)} · took ${formatDuration(snapshot.lastTurn.durationMs)}`,
     elapsedText: '',
   }
 }

@@ -138,8 +138,8 @@ describe('band', () => {
       const ui = await band($, surface, false, 140, 5)
       const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-      expect(text).toContain('준비됨')
-      expect(text).toContain('측정 전')
+      expect(text).toContain('Ready')
+      expect(text).toContain('not measured yet')
       expect(await ui.find({ type: 'Button', key: 'dash' })).toBeDefined()
       await ui.unmount()
     }
@@ -151,10 +151,10 @@ describe('band', () => {
     await measure($, world)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('54% 남음')
-    expect(text).toContain('67% 남음')
-    expect(text).toContain('2h00m 후 리셋')
-    expect(text).toContain('87% 남음')
+    expect(text).toContain('54% left')
+    expect(text).toContain('67% left')
+    expect(text).toContain('resets in 2h00m')
+    expect(text).toContain('87% left')
     expect(text).toContain('$3.41')
   })
 
@@ -167,9 +167,9 @@ describe('band', () => {
     await $.classic.SessionStart({ source: 'clear', session_id: 'session-2' })
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('67% 남음')
+    expect(text).toContain('67% left')
     expect(text).not.toContain('$3.41')
-    expect(text).toContain('컨텍스트 측정 전')
+    expect(text).toContain('Context not measured yet')
   })
 
   test('a window whose reset time passed stops claiming its old reading', async ($, on) => {
@@ -178,7 +178,7 @@ describe('band', () => {
     await measure($, world)
     await world.clock.advance(2 * 3_600_000 + 1_000)
 
-    expect(await bandText($, false, 140)).toContain('리셋됨')
+    expect(await bandText($, false, 140)).toContain('updates on next reply')
   })
 
   test('a running turn shows the tool in flight, and a plan awaiting approval outranks it', async ($, on) => {
@@ -198,20 +198,20 @@ describe('band', () => {
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
     await world.clock.advance(72_000)
 
-    expect(await bandText($, true, 140)).toContain('생각 중')
+    expect(await bandText($, true, 140)).toContain('thinking')
 
     const asking = $.tool.call({ tool: 'ExitPlanMode', tool_use_id: 'plan-1' })
     await world.clock.settle()
     const text = await bandText($, true, 140)
 
-    expect(text).toContain('입력 필요')
-    expect(text).toContain('계획 승인')
+    expect(text).toContain('Needs you')
+    expect(text).toContain('plan approval')
 
     release()
     await asking
     await world.clock.settle()
 
-    expect(await bandText($, true, 140)).toContain('응답 중')
+    expect(await bandText($, true, 140)).toContain('Working')
   })
 
   test('the engine saying nothing runs beats a stale turn record', async ($, on) => {
@@ -219,7 +219,7 @@ describe('band', () => {
     await start($)
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
 
-    expect(await bandText($, false, 140)).not.toContain('응답 중')
+    expect(await bandText($, false, 140)).not.toContain('Working')
   })
 
   test('how the turn ended is the resting state', async ($, on) => {
@@ -228,12 +228,12 @@ describe('band', () => {
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
     await $.turn.complete({ answer: '', durationMs: 5_000, isAborted: true, turnId: 'turn-1', reason: 'aborted' })
 
-    expect(await bandText($, false, 140)).toContain('중단됨')
+    expect(await bandText($, false, 140)).toContain('Interrupted')
 
     await $.turn.start({ text: 'go', turnId: 'turn-2' })
     await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'turn-2', reason: 'answer' })
 
-    expect(await bandText($, false, 140)).toContain('전체 완료')
+    expect(await bandText($, false, 140)).toContain('All done')
   })
 
   test('a subagent still running after the turn is what the session waits on', async ($, on) => {
@@ -244,13 +244,13 @@ describe('band', () => {
     await world.clock.advance(42_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('서브에이전트 대기')
+    expect(text).toContain('Waiting on subagents')
     expect(text).toContain('Explore 42s')
 
     world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'completed' }]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('서브에이전트 대기')
+    expect(await bandText($, false, 140)).not.toContain('Waiting on subagents')
   })
 
   test('teammates count as working only while they are not idle', async ($, on) => {
@@ -263,8 +263,8 @@ describe('band', () => {
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('팀메이트 대기')
-    expect(text).toContain('팀메이트 1/2')
+    expect(text).toContain('Waiting on teammates')
+    expect(text).toContain('teammates 1/2')
   })
 
   test('a backgrounded command is tracked until its notification arrives', async ($, on) => {
@@ -278,7 +278,7 @@ describe('band', () => {
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('백그라운드 대기')
+    expect(await bandText($, false, 140)).toContain('Waiting on background')
 
     await $.prompt.submit({
       text: '<task-notification>\n<task-id>bg-1</task-id>\n<status>completed</status>\n</task-notification>',
@@ -286,7 +286,7 @@ describe('band', () => {
       origin: { kind: 'task-notification' },
     })
 
-    expect(await bandText($, false, 140)).not.toContain('백그라운드')
+    expect(await bandText($, false, 140)).not.toContain('background')
   })
 
   test('a notification that does not end its task leaves it running', async ($, on) => {
@@ -318,16 +318,16 @@ describe('band', () => {
     })
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('백그라운드 1')
+    expect(text).toContain('background 1')
     expect(text).toContain('watch CI')
 
     await $.classic.Stop({ stop_hook_active: false })
 
-    expect(await bandText($, false, 140)).toContain('백그라운드 1')
+    expect(await bandText($, false, 140)).toContain('background 1')
 
     await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
 
-    expect(await bandText($, false, 140)).not.toContain('백그라운드')
+    expect(await bandText($, false, 140)).not.toContain('background')
   })
 
   test('narrow bands drop the bars, short bands drop rows', async ($, on) => {
@@ -341,8 +341,8 @@ describe('band', () => {
     const ui = await band($, 'terminal', false, 140, 1)
     const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-    expect(text).toContain('준비됨')
-    expect(text).not.toContain('컨텍스트')
+    expect(text).toContain('Ready')
+    expect(text).not.toContain('Context')
   })
 
   test('a survey keeps the band', async ($, on) => {
@@ -374,20 +374,20 @@ describe('band layout', () => {
     const wide = await bandText($, false, 140)
 
     expect(wide).toContain('█')
-    expect(wide).toContain('2h00m 후 리셋')
-    expect(wide).toContain('6d0h 후 리셋')
+    expect(wide).toContain('resets in 2h00m')
+    expect(wide).toContain('resets in 6d0h')
 
     const medium = await bandText($, false, 74)
 
     expect(medium).not.toContain('█')
-    expect(medium).toContain('2h00m 후 리셋')
-    expect(medium).not.toContain('6d0h 후 리셋')
-    expect(medium).toContain('87% 남음')
+    expect(medium).toContain('resets in 2h00m')
+    expect(medium).not.toContain('resets in 6d0h')
+    expect(medium).toContain('87% left')
 
     const narrow = await bandText($, false, 50)
 
-    expect(narrow).not.toContain('후 리셋')
-    expect(narrow).toContain('87% 남음')
+    expect(narrow).not.toContain('resets in')
+    expect(narrow).toContain('87% left')
     expect(narrow).not.toContain('/dash')
   })
 
@@ -399,7 +399,7 @@ describe('band layout', () => {
     ]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('팀메이트')
+    expect(await bandText($, false, 140)).not.toContain('teammates')
   })
 
   test('a limit on pace to run out before its reset warns ahead of time', async ($, on) => {
@@ -411,7 +411,7 @@ describe('band layout', () => {
       changed: ['rateLimits'],
     })
 
-    expect(await bandText($, false, 140)).toContain('이 속도면 1h53m 후 소진')
+    expect(await bandText($, false, 140)).toContain('runs out in 1h53m at this pace')
   })
 })
 
@@ -436,7 +436,7 @@ describe('tokens', () => {
     await step($, 'agent-1')
     await world.clock.settle()
 
-    expect(await bandText($, false, 140)).toContain('토큰 2k')
+    expect(await bandText($, false, 140)).toContain('tokens 2k')
   })
 
   test('a resumed session continues its saved count; /clear starts over', async ($, on) => {
@@ -445,11 +445,11 @@ describe('tokens', () => {
     boot(on, SESSION_ID, saved)
     await start($)
 
-    expect(await bandText($, false, 140)).toContain('토큰 1M')
+    expect(await bandText($, false, 140)).toContain('tokens 1M')
 
     await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
 
-    expect(await bandText($, false, 140)).toContain('토큰 0')
+    expect(await bandText($, false, 140)).toContain('tokens 0')
   })
 
   test('switching to another session in the same process loads that session\'s count', async ($, on) => {
@@ -459,7 +459,7 @@ describe('tokens', () => {
     await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
     await $.classic.SessionStart({ source: 'resume', session_id: 'session-2' })
 
-    expect(await bandText($, false, 140)).toContain('토큰 2M')
+    expect(await bandText($, false, 140)).toContain('tokens 2M')
   })
 
   test('a session saved on the way out is found again when it comes back', async ($, on) => {
@@ -481,18 +481,18 @@ describe('tokens', () => {
     await step($, undefined)
     await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
 
-    expect(await bandText($, false, 140)).toContain('토큰 0')
+    expect(await bandText($, false, 140)).toContain('tokens 0')
 
     await $.classic.SessionStart({ source: 'resume', session_id: SESSION_ID })
 
-    expect(await bandText($, false, 140)).toContain('토큰 10')
+    expect(await bandText($, false, 140)).toContain('tokens 10')
   })
 
   test('a store written by something else is ignored, not trusted', async ($, on) => {
     boot(on, SESSION_ID, { [`tokens:${SESSION_ID}`]: { tokens: 'lots' } })
     await start($)
 
-    expect(await bandText($, false, 140)).toContain('토큰 0')
+    expect(await bandText($, false, 140)).toContain('tokens 0')
   })
 })
 
@@ -541,7 +541,7 @@ describe('pane', () => {
           component: 'Pane',
           requestId: PANE_ID,
           props: {
-            title: '세션 현황',
+            title: 'Session',
             isFocused: false,
             bodyColumns: columns,
             placement: 'dock',
@@ -552,7 +552,7 @@ describe('pane', () => {
 
         const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-        for (const expected of ['사용량', '컨텍스트', '5시간', '주간', '토큰', '$3.41', 'Explore', '완료 1', 'Run tests', '팀메이트 없음']) {
+        for (const expected of ['Usage', 'Context', '5-hour', 'Weekly', 'Tokens', '$3.41', 'Explore', 'done 1', 'Run tests', 'Teammates none']) {
           expect(text).toContain(expected)
         }
 
@@ -570,7 +570,7 @@ describe('pane', () => {
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('⚠ 갱신 실패')
-    expect(text).toContain('서브에이전트 대기')
+    expect(text).toContain('⚠ refresh failed')
+    expect(text).toContain('Waiting on subagents')
   })
 })

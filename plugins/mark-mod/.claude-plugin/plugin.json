@@ -1,6 +1,6 @@
 {
   "name": "mark-mod",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live session dashboard above the prompt: state, context, 5-hour and weekly limits, tokens, subagents, teammates and background tasks.",
   "author": {
     "name": "kimkimsh"

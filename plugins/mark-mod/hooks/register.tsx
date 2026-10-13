@@ -24,7 +24,7 @@ import { bandTree, paneTree } from './view'
 
 const PANE_ID = 'mark-mod'
 
-const PANE_TITLE = '세션 현황'
+const PANE_TITLE = 'Session'
 
 const COMMAND = 'dash'
 
@@ -313,7 +313,7 @@ async function resetConversation($: EngineInterface): Promise<void> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: COMMAND, description: '세션 현황 패널을 열거나 닫습니다' })
+    await $.command.register({ name: COMMAND, description: 'Open or close the session dashboard pane' })
     await refreshLive($)
     $.clock.every(TICK_MS, () => {
       requestRefresh($)
@@ -487,7 +487,7 @@ export const register: Register = on => {
   on('command.run', { command: COMMAND }, async $ => {
     const waiting = await togglePane($)
 
-    return waiting === null ? {} : { text: `세션 현황 패널이 자리를 기다립니다: ${waiting}` }
+    return waiting === null ? {} : { text: `The session pane is waiting for room: ${waiting}` }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

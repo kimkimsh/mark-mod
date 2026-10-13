@@ -207,7 +207,7 @@ function workerCounts(view: DashView): string {
   }
 
   if (view.activeTeammates > 0) {
-    counts.push(`${TEAMMATES_LABEL} ${view.activeTeammates}/${view.teammates.length} 작업`)
+    counts.push(`${TEAMMATES_LABEL} ${view.activeTeammates}/${view.teammates.length} working`)
   }
 
   if (view.tasks.length > 0) {
@@ -256,8 +256,8 @@ function bandStatus(kit: Kit, view: DashView, cells: number, trailing: RenderEle
 
   return (
     <Box flexDirection="row" flexShrink={0} gap={1} paddingLeft={1}>
-      {view.listError === null ? null : <Text color="warning">{WARNING_MARK}갱신 실패</Text>}
-      {cells >= BAND_TOKENS_MIN_CELLS ? <Text dimColor>토큰 {tokens.totalText}</Text> : null}
+      {view.listError === null ? null : <Text color="warning">{WARNING_MARK}refresh failed</Text>}
+      {cells >= BAND_TOKENS_MIN_CELLS ? <Text dimColor>tokens {tokens.totalText}</Text> : null}
       {cells >= BAND_COST_MIN_CELLS && tokens.costText !== null ? <Text dimColor>{tokens.costText}</Text> : null}
       {cells >= BAND_BUTTON_MIN_CELLS ? trailing : null}
     </Box>
@@ -356,21 +356,28 @@ function paneWorker(kit: Kit, worker: WorkerView): RenderElement {
   )
 }
 
+function sentenceCase(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+// Group names are lower case for the band's running text; a pane heading
+// starts with a capital.
 function paneWorkers(
   kit: Kit,
-  title: string,
+  group: string,
   summary: string,
   workers: readonly WorkerView[],
   footer: string,
 ): RenderElement {
   const { Box, Text } = kit
+  const title = sentenceCase(group)
 
   if (workers.length === 0 && footer === '') {
     return (
       <Box marginTop={1}>
         <Text>
           <Text bold>{title}</Text>
-          <Text dimColor> 없음</Text>
+          <Text dimColor> none</Text>
         </Text>
       </Box>
     )
@@ -389,11 +396,11 @@ function finishedSummary(view: DashView): string {
   const parts: string[] = []
 
   if (view.doneSubagents > 0) {
-    parts.push(`완료 ${view.doneSubagents}`)
+    parts.push(`done ${view.doneSubagents}`)
   }
 
   if (view.failedSubagents > 0) {
-    parts.push(`실패 ${view.failedSubagents}`)
+    parts.push(`failed ${view.failedSubagents}`)
   }
 
   return parts.join(NOTE_SEPARATOR)
@@ -404,28 +411,28 @@ export function paneTree(kit: Kit, view: DashView, columns: number): RenderEleme
   const { tokens } = view
   const cells = columns >= PANE_COLUMNS_WIDE ? PANE_BAR_CELLS_WIDE : PANE_BAR_CELLS_NARROW
   const runningSubagents = view.subagents.filter(worker => worker.isActive)
-  const teammateSummary = view.teammates.length === 0 ? '' : `${view.activeTeammates} 작업 중 · ${view.idleTeammates} 유휴`
+  const teammateSummary = view.teammates.length === 0 ? '' : `${view.activeTeammates} working · ${view.idleTeammates} idle`
 
   return (
     <Box flexDirection="column" width={columns}>
       {headlineText(kit, view)}
       {view.listError === null ? null : (
         <Text color="warning" wrap="truncate-end">
-          {WARNING_MARK}에이전트 목록을 읽지 못했습니다: {view.listError}
+          {WARNING_MARK}Could not read the agent list: {view.listError}
         </Text>
       )}
       <Box flexDirection="column" marginTop={1}>
-        {paneSectionTitle(kit, '사용량', '')}
+        {paneSectionTitle(kit, 'Usage', '')}
         {view.meters.map(meter => paneMeter(kit, meter, cells))}
         {view.limitsNote === null ? null : <Text dimColor>{view.limitsNote}</Text>}
       </Box>
       <Box flexDirection="column" marginTop={1}>
-        {paneSectionTitle(kit, '토큰', tokens.costText === null ? tokens.totalText : `${tokens.totalText} · ${tokens.costText}`)}
+        {paneSectionTitle(kit, 'Tokens', tokens.costText === null ? tokens.totalText : `${tokens.totalText} · ${tokens.costText}`)}
         <Text dimColor wrap="truncate-end">
-          입력 {tokens.inputText} · 출력 {tokens.outputText} · 캐시 읽기 {tokens.cacheReadText} · 캐시 쓰기 {tokens.cacheWriteText}
+          input {tokens.inputText} · output {tokens.outputText} · cache read {tokens.cacheReadText} · cache write {tokens.cacheWriteText}
         </Text>
         <Text dimColor wrap="truncate-end">
-          메인 {tokens.mainText} · 에이전트 {tokens.agentsText}
+          main {tokens.mainText} · agents {tokens.agentsText}
         </Text>
       </Box>
       {paneWorkers(

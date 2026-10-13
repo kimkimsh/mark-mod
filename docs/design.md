@@ -27,13 +27,13 @@ Priority order; the first that holds is the headline.
 
 | State | Holds when | Colour |
 |---|---|---|
-| 입력 필요 (needs you) | `AskUserQuestion` (질문) or `ExitPlanMode` (계획 승인) is in flight; shows how long it has waited | warning |
-| 응답 중 (working) | the main loop has a turn running; shows the tool in flight (the engine's spinner already shows the elapsed time) | claude |
-| 서브에이전트 / 팀메이트 / 백그라운드 대기 | main loop idle, but subagents running, teammates working, or background tasks in flight (several may hold; the label names all that do, comma-separated) | suggestion |
-| 전체 완료 (all done) | nothing running, last turn answered | success |
-| 중단됨 (interrupted) | nothing running, last turn aborted | inactive |
-| 오류 (error) | nothing running, last turn ended by an API error or a refusal | error |
-| 준비됨 (ready) | no turn yet this session | inactive |
+| Needs you | `AskUserQuestion` (`question`) or `ExitPlanMode` (`plan approval`) is in flight; shows how long it has waited | warning |
+| Working | the main loop has a turn running; shows the tool in flight (the engine's spinner already shows the elapsed time) | claude |
+| Waiting on subagents / teammates / background | main loop idle, but subagents running, teammates working, or background tasks in flight (several may hold; the label names all that do, comma-separated) | suggestion |
+| All done | nothing running, last turn answered | success |
+| Interrupted | nothing running, last turn aborted | inactive |
+| Ended with an error / Refused | nothing running, last turn ended by an API error or a refusal | error |
+| Ready | no turn yet this session | inactive |
 
 Not detected: the permission dialog. The engine raises `classic.PermissionRequest`
 when it opens but nothing when it closes, so after an approval the state could
@@ -44,17 +44,18 @@ band would be.
 ## Data rules (failure paths)
 
 - **No reading is not zero.** Context and rate limits before the first
-  response read "측정 전", never `0%`. Rate limits still empty *after* a
-  response read "정보 없음" in the pane and leave the band (API-key sessions).
+  response read "not measured yet", never `0%`. Rate limits still empty
+  *after* a response read "no data" in the pane and leave the band (API-key
+  sessions).
 - **Windows belong to the account.** A reading with no windows (the first one
   after `/clear`) keeps the last known windows; their `resetsAt` still retires
   them on time.
 - **A reset window is not still full.** When `resetsAt` has passed, the last
-  reading is stale: the meter reads "리셋됨" until the next response refreshes it.
+  reading is stale: the meter reads "reset" until the next response refreshes it.
 - **`background_tasks` absent ≠ empty.** An older build leaves the field out;
   reconciliation then does nothing rather than clearing the list.
 - **Agent list pull fails** → the previous list stays; the band shows
-  "⚠ 갱신 실패" and the pane the error text. The 1 s tick is the retry.
+  "⚠ refresh failed" and the pane the error text. The 1 s tick is the retry.
 - **One pull at a time.** The tick and the event hooks share a single-flight
   refresh, so a slow `$.agent.list()` cannot overwrite a newer one. Hooks never
   await it, so a slow list cannot hold up a turn.
@@ -72,7 +73,7 @@ band would be.
 A 1 s `$.clock.every` tick pulls `$.agent.list()` and the clock. It writes only
 when something changed; while nothing runs the clock is stored at 30 s
 resolution, so an idle session costs one write per 30 s, and "ago" text is
-drawn in whole minutes ("방금", "4m 전") so it never shows invented seconds.
+drawn in whole minutes ("just now", "4m ago") so it never shows invented seconds.
 
 Usage needs no polling: `session.measure` fires after every response.
 
@@ -99,12 +100,12 @@ Tokens spent before the mod loaded in a session are not counted.
 ## Layout
 
 Band (2–3 rows, width = `props.bodyColumns`, indented two cells to line up
-with the engine's footer), as captured from a live session:
+with the engine's footer):
 
 ```
-  ● 응답 중  생각 중                                                       토큰 1.09M $0.14 /dash
-  컨텍스트 ████████▉░ 89% 남음   5시간 ████▌░░░░░ 45% 남음 · 이 속도면 1h35m 후 소진   주간 ████████▎░ 82% 남음 · 6d5h 후 리셋
-  서브에이전트 1 · 백그라운드 1   Explore 6s   Run sleep 40 6s
+  ● Working  thinking                                                    tokens 1.09M $0.14 /dash
+  Context ████████▉░ 89% left   5-hour ████▌░░░░░ 45% left · runs out in 1h35m at this pace   Weekly ████████▎░ 82% left · resets in 6d5h
+  subagents 1 · background 1   Explore 6s   Run sleep 40 6s
 ```
 
 Every meter is a fuel gauge: the bar is what is **left**, the number beside it
@@ -119,7 +120,7 @@ group drops `/dash`, then cost, then tokens. The third row appears only while
 something runs.
 
 Pane: the same three blocks expanded, one row per running agent/task; finished
-subagents fold into one line (`완료 3 · 실패 1`); an empty group is one line.
+subagents fold into one line (`done 3 · failed 1`); an empty group is one line.
 
 ## Files
 
