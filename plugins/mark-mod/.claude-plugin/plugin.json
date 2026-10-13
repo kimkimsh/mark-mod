@@ -1,0 +1,17 @@
+{
+  "name": "mark-mod",
+  "version": "0.1.0",
+  "description": "Live session dashboard above the prompt: state, context, 5-hour and weekly limits, tokens, subagents, teammates and background tasks.",
+  "author": {
+    "name": "kimkimsh"
+  },
+  "repository": "https://github.com/kimkimsh/mark-mod",
+  "keywords": [
+    "dashboard",
+    "status",
+    "context",
+    "rate-limit",
+    "subagents"
+  ],
+  "types": "./types/index.d.ts"
+}
