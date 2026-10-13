@@ -1,0 +1,14 @@
+{
+  "name": "mark-mod",
+  "description": "Claude Code mods by kimkimsh.",
+  "owner": {
+    "name": "kimkimsh"
+  },
+  "plugins": [
+    {
+      "name": "mark-mod",
+      "source": "./plugins/mark-mod",
+      "description": "Live session dashboard above the prompt: state, context, 5-hour and weekly limits, tokens, subagents, teammates and background tasks."
+    }
+  ]
+}

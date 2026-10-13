@@ -1,0 +1,9 @@
+{
+  "extends": "./.claude-plugin/types/tsconfig.json",
+  "compilerOptions": {
+    // The mod calls no MCP tool. claude-code-mcp lists whatever servers this
+    // machine has connected, and a large set pushes $.tool.call's per-tool
+    // overloads past TypeScript's instantiation depth (TS2589).
+    "types": ["claude-code", "claude-code-tools"]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "mark-mod-workspace",
+  "private": true,
+  "description": "Development tooling for the mark-mod Claude Code mod; the mod itself is plugins/mark-mod.",
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint",
+    "typecheck": "tsc -p plugins/mark-mod",
+    "test": "claude plugin test plugins/mark-mod",
+    "validate": "claude plugin validate . && claude plugin validate plugins/mark-mod",
+    "check": "npm run lint && npm run typecheck && npm run validate && npm run test"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.87.0",
+    "oxlint": "1.87.0"
+  }
+}
