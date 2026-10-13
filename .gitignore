@@ -12,6 +12,7 @@ CLAUDE.local.md
 # Local session history / memory produced by plugins
 .remember/
 .gbrain/
+.serena/
 
 # --- Secrets & environment ---
 .env
