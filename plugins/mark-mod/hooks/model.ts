@@ -12,9 +12,9 @@ import type {
   DashUsage,
 } from '../types'
 
-export const SEVERITY_WARN_PERCENT = 60
+const SEVERITY_WARN_PERCENT = 60
 
-export const SEVERITY_DANGER_PERCENT = 85
+const SEVERITY_DANGER_PERCENT = 85
 
 const PERCENT_FULL = 100
 
@@ -28,15 +28,17 @@ const HOURS_PER_DAY = 24
 
 const SHORT_MINUTES_WITH_SECONDS = 10
 
-const THOUSAND = 1000
+// Token totals scale through k, M and B; under ten of a unit they keep one
+// more decimal so a count still moves visibly.
+const TOKEN_UNITS = [
+  { size: 1_000, suffix: 'k', decimals: 0 },
+  { size: 1_000_000, suffix: 'M', decimals: 1 },
+  { size: 1_000_000_000, suffix: 'B', decimals: 1 },
+]
 
-const MILLION = 1_000_000
+const TOKEN_UNIT_STEP = 1000
 
-const BILLION = 1_000_000_000
-
-const ONE_DECIMAL_BELOW = 10
-
-const TWO_DECIMALS_BELOW = 10
+const MORE_DECIMALS_BELOW = 10
 
 const CENT = 0.01
 
@@ -50,21 +52,58 @@ const EMPTY_BLOCK = '░'
 
 const BLANK_CELL = ' '
 
-const ASKING_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
+const ELLIPSIS = '…'
+
+const QUESTION_TOOL = 'AskUserQuestion'
+
+const PLAN_APPROVAL_TOOL = 'ExitPlanMode'
+
+const ASKING_TOOLS = new Set([QUESTION_TOOL, PLAN_APPROVAL_TOOL])
+
+const NO_READING = '—'
+
+const NOT_MEASURED = '측정 전'
+
+export const SUBAGENTS_LABEL = '서브에이전트'
+
+export const TEAMMATES_LABEL = '팀메이트'
+
+export const BACKGROUND_LABEL = '백그라운드'
+
+export const RUNNING_TEXT = '실행 중'
 
 const ACTIVE_AGENT_STATUSES = new Set<DashAgentStatus>(['pending', 'running', 'waiting'])
 
-// Agent loops are drawn from $.agent.list(); the same loops also appear in
-// background_tasks, so counting them there would show each agent twice.
-const AGENT_TASK_KINDS = new Set(['subagent', 'teammate'])
+const SUBAGENT_TASK_KIND = 'subagent'
+
+const NOTIFICATION_PATTERN = /<task-notification>([\s\S]*?)<\/task-notification>/g
 
 const TASK_ID_PATTERN = /<task-id>([^<]+)<\/task-id>/
 
+const TASK_STATUS_PATTERN = /<status>([^<]+)<\/status>/
+
+// Words a notification ends a task with; any other word (a monitor's event,
+// a progress note) leaves the task running until the Stop snapshot says.
+const ENDED_TASK_STATUSES = new Set(['completed', 'failed', 'killed'])
+
 export const CONTEXT_METER_KEY = 'context'
 
-export const FIVE_HOUR_LIMIT = 'five_hour'
+const FIVE_HOUR_LIMIT = 'five_hour'
 
-export const SEVEN_DAY_LIMIT = 'seven_day'
+const SEVEN_DAY_LIMIT = 'seven_day'
+
+const LIMIT_WINDOW_MS = new Map([
+  [FIVE_HOUR_LIMIT, 5 * 60 * 60 * 1000],
+  [SEVEN_DAY_LIMIT, 7 * 24 * 60 * 60 * 1000],
+])
+
+// A projection from the start of a window is mostly noise: the first
+// quarter hour of a 5-hour window, and the first two days of a week, whose
+// nights and idle days a straight line cannot see yet.
+const PACE_MIN_ELAPSED_MS = new Map([
+  [FIVE_HOUR_LIMIT, 15 * 60 * 1000],
+  [SEVEN_DAY_LIMIT, 2 * 24 * 60 * 60 * 1000],
+])
 
 const LIMIT_LABELS = new Map([
   [FIVE_HOUR_LIMIT, '5시간'],
@@ -125,6 +164,8 @@ export type DashView = {
   activeSubagents: number
   activeTeammates: number
   idleTeammates: number
+  doneSubagents: number
+  failedSubagents: number
   listError: string | null
 }
 
@@ -147,7 +188,7 @@ export type UsageCounts = {
   cache_creation_input_tokens: number
 }
 
-export type RateLimitReading = { kind: string; percentUsed: number; resetsAt?: string }
+type RateLimitReading = { kind: string; percentUsed: number; resetsAt?: string }
 
 export type UsageReading = {
   context: { tokens?: number; window: number; percent?: number }
@@ -155,7 +196,7 @@ export type UsageReading = {
   cost?: { usd: number }
 }
 
-export type AgentReading = {
+type AgentReading = {
   id: string
   description: string
   type: string
@@ -172,7 +213,7 @@ export type TaskReading = {
   command?: string
 }
 
-export function emptyCounts(): DashCounts {
+function emptyCounts(): DashCounts {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 }
 
@@ -180,7 +221,7 @@ export function emptyTokens(): DashTokens {
   return { main: emptyCounts(), agents: emptyCounts() }
 }
 
-export function addUsage(counts: DashCounts, usage: UsageCounts): DashCounts {
+function addUsage(counts: DashCounts, usage: UsageCounts): DashCounts {
   return {
     input: counts.input + usage.input_tokens,
     output: counts.output + usage.output_tokens,
@@ -195,7 +236,16 @@ export function addTokens(tokens: DashTokens, usage: UsageCounts, isMainLoop: bo
     : { main: tokens.main, agents: addUsage(tokens.agents, usage) }
 }
 
-export function sumCounts(counts: DashCounts): number {
+function mergeCounts(a: DashCounts, b: DashCounts): DashCounts {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+  }
+}
+
+function sumCounts(counts: DashCounts): number {
   return counts.input + counts.output + counts.cacheRead + counts.cacheWrite
 }
 
@@ -211,10 +261,21 @@ export function isAskingTool(tool: string): boolean {
   return ASKING_TOOLS.has(tool)
 }
 
-export function parseTaskNotificationId(text: string): string | null {
-  const match = TASK_ID_PATTERN.exec(text)
+// One prompt may carry several notifications when tasks end together.
+export function endedTaskIds(text: string): string[] {
+  const ids: string[] = []
 
-  return match?.[1]?.trim() ?? null
+  for (const notification of text.matchAll(NOTIFICATION_PATTERN)) {
+    const body = notification[1] ?? ''
+    const id = TASK_ID_PATTERN.exec(body)?.[1]?.trim()
+    const status = TASK_STATUS_PATTERN.exec(body)?.[1]?.trim()
+
+    if (id !== undefined && status !== undefined && ENDED_TASK_STATUSES.has(status)) {
+      ids.push(id)
+    }
+  }
+
+  return ids
 }
 
 function parseResetTime(resetsAt: string | undefined): number | null {
@@ -259,24 +320,30 @@ export function agentsFromReading(
   }))
 }
 
+// Agent loops are drawn from $.agent.list(); the same loops also appear in
+// background_tasks, so an entry naming a listed agent would show it twice.
 export function tasksFromReading(
   readings: readonly TaskReading[],
   previous: readonly DashTask[],
+  agentIds: ReadonlySet<string>,
   now: number,
 ): DashTask[] {
-  const startedAt = new Map(previous.map(task => [task.id, task.startedAt]))
+  const known = new Map(previous.map(task => [task.id, task]))
   const tasks: DashTask[] = []
 
   for (const reading of readings) {
-    if (AGENT_TASK_KINDS.has(reading.type)) {
+    if (reading.type === SUBAGENT_TASK_KIND || agentIds.has(reading.id)) {
       continue
     }
+
+    // A row keeps the name it was first drawn with.
+    const seen = known.get(reading.id)
 
     tasks.push({
       id: reading.id,
       kind: reading.type,
-      label: reading.command ?? reading.description,
-      startedAt: startedAt.get(reading.id) ?? now,
+      description: seen?.description ?? (reading.description === '' ? (reading.command ?? reading.type) : reading.description),
+      startedAt: seen?.startedAt ?? now,
     })
   }
 
@@ -290,6 +357,12 @@ export function withKnownLimits(previous: DashUsage | null, next: DashUsage): Da
   return next.limits.length === 0 && previous !== null ? { ...next, limits: previous.limits } : next
 }
 
+// What survives the end of a conversation: the window size and the
+// account's rate-limit windows.
+export function withoutConversation(usage: DashUsage): DashUsage {
+  return { ...usage, contextTokens: null, contextPercent: null, costUsd: null }
+}
+
 export function withTask(tasks: readonly DashTask[], task: DashTask): DashTask[] {
   return tasks.some(one => one.id === task.id) ? [...tasks] : [...tasks, task]
 }
@@ -298,12 +371,65 @@ export function withoutTask(tasks: readonly DashTask[], id: string): DashTask[] 
   return tasks.filter(task => task.id !== id)
 }
 
-export function severityOf(usedPercent: number): Severity {
+export function withoutTasks(tasks: readonly DashTask[], ids: readonly string[]): DashTask[] {
+  return tasks.filter(task => !ids.includes(task.id))
+}
+
+function severityOf(usedPercent: number): Severity {
   if (usedPercent >= SEVERITY_DANGER_PERCENT) {
     return 'danger'
   }
 
   return usedPercent >= SEVERITY_WARN_PERCENT ? 'warn' : 'ok'
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { ok: 0, warn: 1, danger: 2 }
+
+function worseOf(a: Severity, b: Severity): Severity {
+  return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b
+}
+
+// Hangul, CJK and fullwidth forms take two terminal cells; everything this
+// mod draws besides them takes one.
+function isWide(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x1100 && codePoint <= 0x115f) ||
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+    (codePoint >= 0xfe30 && codePoint <= 0xfe4f) ||
+    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    codePoint >= 0x20000
+  )
+}
+
+export function cellWidth(text: string): number {
+  let cells = 0
+
+  for (const char of text) {
+    cells += isWide(char.codePointAt(0) ?? 0) ? 2 : 1
+  }
+
+  return cells
+}
+
+export function clipCells(text: string, limit: number): string {
+  if (cellWidth(text) <= limit) {
+    return text
+  }
+
+  let clipped = ''
+
+  for (const char of text) {
+    if (cellWidth(clipped + char) > limit - 1) {
+      break
+    }
+
+    clipped += char
+  }
+
+  return clipped + ELLIPSIS
 }
 
 export type BarCells = { fill: string; rest: string }
@@ -327,27 +453,35 @@ function trimZeros(text: string): string {
 }
 
 export function formatTokens(count: number): string {
-  if (count < THOUSAND) {
+  const [smallest] = TOKEN_UNITS
+
+  if (smallest === undefined || count < smallest.size) {
     return String(count)
   }
 
-  if (count < MILLION) {
-    const thousands = count / THOUSAND
+  let text = ''
 
-    return `${trimZeros(thousands.toFixed(thousands < ONE_DECIMAL_BELOW ? 1 : 0))}k`
+  // Smallest unit first, so a value that rounds up to the next unit's size
+  // ("1000k") is written in that unit instead.
+  for (const unit of TOKEN_UNITS) {
+    const scaled = count / unit.size
+    const rounded = scaled.toFixed(scaled < MORE_DECIMALS_BELOW ? unit.decimals + 1 : unit.decimals)
+    text = trimZeros(rounded) + unit.suffix
+
+    if (Number(rounded) < TOKEN_UNIT_STEP) {
+      break
+    }
   }
 
-  if (count < BILLION) {
-    const millions = count / MILLION
-
-    return `${trimZeros(millions.toFixed(millions < TWO_DECIMALS_BELOW ? 2 : 1))}M`
-  }
-
-  return `${trimZeros((count / BILLION).toFixed(2))}B`
+  return text
 }
 
 export function formatCost(usd: number): string {
   return usd > 0 && usd < CENT ? '<$0.01' : `$${usd.toFixed(2)}`
+}
+
+function twoDigits(value: number): string {
+  return String(value).padStart(2, '0')
 }
 
 export function formatDuration(ms: number): string {
@@ -360,7 +494,7 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / SECONDS_PER_MINUTE)
 
   if (minutes < SHORT_MINUTES_WITH_SECONDS) {
-    return `${minutes}m${String(seconds % SECONDS_PER_MINUTE).padStart(2, '0')}s`
+    return `${minutes}m${twoDigits(seconds % SECONDS_PER_MINUTE)}s`
   }
 
   if (minutes < MINUTES_PER_HOUR) {
@@ -370,7 +504,7 @@ export function formatDuration(ms: number): string {
   const hours = Math.floor(minutes / MINUTES_PER_HOUR)
 
   if (hours < HOURS_PER_DAY) {
-    return `${hours}h${String(minutes % MINUTES_PER_HOUR).padStart(2, '0')}m`
+    return `${hours}h${twoDigits(minutes % MINUTES_PER_HOUR)}m`
   }
 
   return `${Math.floor(hours / HOURS_PER_DAY)}d${hours % HOURS_PER_DAY}h`
@@ -389,9 +523,9 @@ function formatAgo(ms: number): string {
 
 function contextMeter(usage: DashUsage | null): MeterView {
   const usedPercent = usage?.contextPercent ?? null
-  const windowText = usage === null ? '—' : formatTokens(usage.contextWindow)
-  const tokensText = usage === null || usage.contextTokens === null ? '—' : formatTokens(usage.contextTokens)
-  const leftPercent = usedPercent === null ? null : PERCENT_FULL - usedPercent
+  const windowText = usage === null ? NO_READING : formatTokens(usage.contextWindow)
+  const tokensText = usage === null || usage.contextTokens === null ? NO_READING : formatTokens(usage.contextTokens)
+  const leftPercent = usedPercent === null ? null : Math.max(0, PERCENT_FULL - usedPercent)
 
   return {
     key: CONTEXT_METER_KEY,
@@ -399,7 +533,7 @@ function contextMeter(usage: DashUsage | null): MeterView {
     isAvailable: true,
     leftPercent,
     severity: usedPercent === null ? 'ok' : severityOf(usedPercent),
-    valueText: leftPercent === null ? '측정 전' : `${leftPercent}% 남음`,
+    valueText: leftPercent === null ? NOT_MEASURED : `${Math.floor(leftPercent)}% 남음`,
     noteText: `${tokensText} / ${windowText}`,
   }
 }
@@ -414,7 +548,7 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
       isAvailable: !hasResponse,
       leftPercent: null,
       severity: 'ok',
-      valueText: hasResponse ? '정보 없음' : '측정 전',
+      valueText: hasResponse ? '정보 없음' : NOT_MEASURED,
       noteText: '',
     }
   }
@@ -434,16 +568,41 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
   }
 
   const leftPercent = Math.max(0, PERCENT_FULL - limit.percentUsed)
+  const exhaustsIn = exhaustsBeforeReset(limit, now)
+  const resetNote = limit.resetsAt === null ? '' : `${formatDuration(limit.resetsAt - now)} 후 리셋`
 
   return {
     key: kind,
     label,
     isAvailable: true,
     leftPercent,
-    severity: severityOf(limit.percentUsed),
+    severity: exhaustsIn === null ? severityOf(limit.percentUsed) : worseOf(severityOf(limit.percentUsed), 'warn'),
     valueText: `${Math.floor(leftPercent)}% 남음`,
-    noteText: limit.resetsAt === null ? '' : `${formatDuration(limit.resetsAt - now)} 후 리셋`,
+    noteText: exhaustsIn === null ? resetNote : `이 속도면 ${formatDuration(exhaustsIn)} 후 소진`,
   }
+}
+
+// Linear projection of this window's use so far: the time until it runs
+// out, when that comes before the reset; null when the pace is safe or the
+// window is too young to judge.
+export function exhaustsBeforeReset(limit: DashLimit, now: number): number | null {
+  const windowMs = LIMIT_WINDOW_MS.get(limit.kind)
+  const minElapsedMs = PACE_MIN_ELAPSED_MS.get(limit.kind)
+
+  if (windowMs === undefined || minElapsedMs === undefined || limit.resetsAt === null || limit.percentUsed <= 0) {
+    return null
+  }
+
+  const untilReset = limit.resetsAt - now
+  const elapsed = windowMs - untilReset
+
+  if (elapsed < minElapsedMs) {
+    return null
+  }
+
+  const exhaustsIn = ((PERCENT_FULL - limit.percentUsed) * elapsed) / limit.percentUsed
+
+  return exhaustsIn < untilReset ? exhaustsIn : null
 }
 
 function meterViews(usage: DashUsage | null, now: number, hasResponse: boolean): MeterView[] {
@@ -473,12 +632,7 @@ function limitsNoteOf(usage: DashUsage | null, hasResponse: boolean): string | n
 }
 
 function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
-  const all = addUsage(tokens.main, {
-    input_tokens: tokens.agents.input,
-    output_tokens: tokens.agents.output,
-    cache_read_input_tokens: tokens.agents.cacheRead,
-    cache_creation_input_tokens: tokens.agents.cacheWrite,
-  })
+  const all = mergeCounts(tokens.main, tokens.agents)
 
   return {
     totalText: formatTokens(sumCounts(all)),
@@ -494,8 +648,8 @@ function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
 
 const AGENT_STATUS_TEXT: Record<DashAgentStatus, string> = {
   pending: '시작 중',
-  running: '실행 중',
-  waiting: '대기',
+  running: RUNNING_TEXT,
+  waiting: '멈춤',
   idle: '유휴',
   completed: '완료',
   failed: '실패',
@@ -521,7 +675,7 @@ function taskView(task: DashTask, now: number): WorkerView {
     id: task.id,
     kind: 'task',
     label: task.kind,
-    description: task.label,
+    description: task.description,
     isActive: true,
     isIdle: false,
     statusText: AGENT_STATUS_TEXT.running,
@@ -551,9 +705,9 @@ type WorkerCounts = Pick<DashView, 'activeSubagents' | 'activeTeammates' | 'task
 
 function waitingTitle(workers: WorkerCounts): string | null {
   const groups = [
-    { name: '서브에이전트', count: workers.activeSubagents },
-    { name: '팀메이트', count: workers.activeTeammates },
-    { name: '백그라운드', count: workers.tasks.length },
+    { name: SUBAGENTS_LABEL, count: workers.activeSubagents },
+    { name: TEAMMATES_LABEL, count: workers.activeTeammates },
+    { name: BACKGROUND_LABEL, count: workers.tasks.length },
   ]
 
   const names: string[] = []
@@ -564,7 +718,7 @@ function waitingTitle(workers: WorkerCounts): string | null {
     }
   }
 
-  return names.length === 0 ? null : `${names.join('·')} 대기`
+  return names.length === 0 ? null : `${names.join(', ')} 대기`
 }
 
 function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
@@ -575,7 +729,7 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
     return {
       phase: 'needs-input',
       title: '입력 필요',
-      detail: ask.tool === 'ExitPlanMode' ? '계획 승인을 기다립니다' : '질문에 답해 주세요',
+      detail: ask.tool === PLAN_APPROVAL_TOOL ? '계획 승인' : '질문',
       elapsedText: formatDuration(now - ask.startedAt),
     }
   }
@@ -585,7 +739,7 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
       phase: 'working',
       title: '응답 중',
       detail: callsDetail(snapshot.turn?.calls ?? []),
-      elapsedText: snapshot.turn === null ? '' : formatDuration(now - snapshot.turn.startedAt),
+      elapsedText: '',
     }
   }
 
@@ -596,12 +750,12 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
       phase: 'waiting',
       title: waiting,
       detail: '',
-      elapsedText: snapshot.lastTurn === null ? '' : formatDuration(now - snapshot.lastTurn.endedAt),
+      elapsedText: '',
     }
   }
 
   if (snapshot.lastTurn === null) {
-    return { phase: 'ready', title: '대기 중', detail: '', elapsedText: '' }
+    return { phase: 'ready', title: '준비됨', detail: '', elapsedText: '' }
   }
 
   const end = TURN_END_TITLES[snapshot.lastTurn.reason]
@@ -614,10 +768,14 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   }
 }
 
+function activeFirst(a: WorkerView, b: WorkerView): number {
+  return Number(b.isActive) - Number(a.isActive)
+}
+
 export function buildView(snapshot: DashSnapshot): DashView {
   const now = snapshot.live.now
   const agents = snapshot.live.agents.map(agent => agentView(agent, now))
-  const subagents = agents.filter(agent => agent.kind === 'subagent')
+  const subagents = agents.filter(agent => agent.kind === 'subagent').sort(activeFirst)
   const teammates = agents.filter(agent => agent.kind === 'teammate')
   const tasks = snapshot.tasks.map(task => taskView(task, now))
 
@@ -638,6 +796,10 @@ export function buildView(snapshot: DashSnapshot): DashView {
     activeSubagents: workers.activeSubagents,
     activeTeammates: workers.activeTeammates,
     idleTeammates: teammates.filter(agent => agent.isIdle).length,
+    doneSubagents: snapshot.live.agents.filter(agent => !agent.isTeammate && agent.status === 'completed').length,
+    failedSubagents: snapshot.live.agents.filter(
+      agent => !agent.isTeammate && (agent.status === 'failed' || agent.status === 'killed'),
+    ).length,
     listError: snapshot.live.listError,
   }
 }

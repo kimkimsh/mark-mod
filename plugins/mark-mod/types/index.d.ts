@@ -2,7 +2,7 @@ export type DashCall = { id: string; tool: string; startedAt: number }
 
 export type DashTurn = { turnId: string; startedAt: number; calls: DashCall[] }
 
-export type DashTask = { id: string; kind: string; label: string; startedAt: number }
+export type DashTask = { id: string; kind: string; description: string; startedAt: number }
 
 export type DashCounts = {
   input: number

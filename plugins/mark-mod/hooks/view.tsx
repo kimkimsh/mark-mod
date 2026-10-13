@@ -1,19 +1,39 @@
 import type { Color, Elements, RenderElement } from 'claude-code'
 
-import { BAND_LIMIT_KINDS, CONTEXT_METER_KEY, barCells } from './model'
+import {
+  BACKGROUND_LABEL,
+  BAND_LIMIT_KINDS,
+  CONTEXT_METER_KEY,
+  RUNNING_TEXT,
+  SUBAGENTS_LABEL,
+  TEAMMATES_LABEL,
+  barCells,
+  cellWidth,
+  clipCells,
+} from './model'
 import type { DashView, MeterView, Phase, Severity, WorkerView } from './model'
 
 export type Kit = Pick<Elements['mobile'], 'Box' | 'Text'>
 
+// The engine's own footer rows start two cells in; the band lines up with
+// them so it reads as part of the prompt area, not as a transcript row.
+const BAND_INDENT = 2
+
 const BAR_CELLS_WIDE = 10
 
-const BAR_CELLS_MEDIUM = 6
+const BAR_CELLS_NARROW = 6
 
-const BAND_COLUMNS_WIDE = 118
+const ITEM_GAP = '   '
 
-const BAND_COLUMNS_MEDIUM = 92
+const NOTE_SEPARATOR = ' · '
 
-const BAND_COLUMNS_NARROW = 64
+const WARNING_MARK = '⚠ '
+
+const BAND_BUTTON_MIN_CELLS = 98
+
+const BAND_COST_MIN_CELLS = 78
+
+const BAND_TOKENS_MIN_CELLS = 50
 
 const BAND_ROWS_FULL = 3
 
@@ -21,7 +41,7 @@ const BAND_ROWS_TWO = 2
 
 const BAND_WORKER_ITEMS = 4
 
-const BAND_TASK_LABEL_CHARS = 28
+const BAND_WORKER_NAME_CELLS = 24
 
 const PANE_BAR_CELLS_WIDE = 16
 
@@ -37,10 +57,6 @@ const PANE_GLYPH_COLUMNS = 2
 
 const PANE_AGE_COLUMNS = 7
 
-const ELLIPSIS = '…'
-
-const BAND_ITEM_GAP = '   '
-
 const PHASE_STYLE: Record<Phase, { glyph: string; color: Color }> = {
   'needs-input': { glyph: '◆', color: 'warning' },
   working: { glyph: '●', color: 'claude' },
@@ -51,18 +67,54 @@ const PHASE_STYLE: Record<Phase, { glyph: string; color: Color }> = {
   ready: { glyph: '○', color: 'inactive' },
 }
 
+// Healthy gauges stay grey: the band is on screen all day, and colour is kept
+// for the moments that need attention.
 const SEVERITY_COLOR: Record<Severity, Color> = {
-  ok: 'success',
+  ok: 'inactive',
   warn: 'warning',
   danger: 'error',
 }
 
-function clip(text: string, limit: number): string {
-  return text.length <= limit ? text : text.slice(0, limit - 1) + ELLIPSIS
-}
+type MeterLayout = { barCells: number; noteKeys: readonly string[] }
 
 function meterVisibleInBand(meter: MeterView): boolean {
   return meter.isAvailable && (meter.key === CONTEXT_METER_KEY || BAND_LIMIT_KINDS.includes(meter.key))
+}
+
+function valueText(meter: MeterView): string {
+  return meter.severity === 'danger' ? WARNING_MARK + meter.valueText : meter.valueText
+}
+
+function meterCells(meter: MeterView, layout: MeterLayout): number {
+  const bar = layout.barCells > 0 && meter.leftPercent !== null ? layout.barCells + 1 : 0
+  const note = layout.noteKeys.includes(meter.key) && meter.noteText !== '' ? cellWidth(NOTE_SEPARATOR + meter.noteText) : 0
+
+  return cellWidth(meter.label) + 1 + bar + cellWidth(valueText(meter)) + note
+}
+
+function rowCells(meters: readonly MeterView[], layout: MeterLayout): number {
+  let cells = 0
+
+  for (const meter of meters) {
+    cells += meterCells(meter, layout)
+  }
+
+  return cells + cellWidth(ITEM_GAP) * Math.max(0, meters.length - 1)
+}
+
+// Richest first. Values always show; the reset notes come next, the 5-hour
+// one before the weekly one, and the bars are the first thing to go.
+function bandLayouts(): MeterLayout[] {
+  const [fiveHour, weekly] = BAND_LIMIT_KINDS
+  const bothNotes = [fiveHour ?? '', weekly ?? '']
+
+  return [
+    { barCells: BAR_CELLS_WIDE, noteKeys: bothNotes },
+    { barCells: BAR_CELLS_NARROW, noteKeys: bothNotes },
+    { barCells: 0, noteKeys: bothNotes },
+    { barCells: 0, noteKeys: [fiveHour ?? ''] },
+    { barCells: 0, noteKeys: [] },
+  ]
 }
 
 function headlineText(kit: Kit, view: DashView): RenderElement {
@@ -95,37 +147,44 @@ function meterBar(kit: Kit, meter: MeterView, cells: number): RenderElement {
 
 function meterValue(kit: Kit, meter: MeterView): RenderElement {
   const { Text } = kit
-  const isAlarming = meter.leftPercent !== null && meter.severity !== 'ok'
 
-  return isAlarming ? <Text color={SEVERITY_COLOR[meter.severity]}>{meter.valueText}</Text> : <Text>{meter.valueText}</Text>
-}
-
-function bandMeters(kit: Kit, view: DashView, columns: number): RenderElement {
-  const { Text } = kit
-  const cells = columns >= BAND_COLUMNS_WIDE ? BAR_CELLS_WIDE : columns >= BAND_COLUMNS_MEDIUM ? BAR_CELLS_MEDIUM : 0
-  const showsNotes = columns >= BAND_COLUMNS_NARROW
-  const parts: RenderElement[] = []
-
-  for (const meter of view.meters) {
-    if (!meterVisibleInBand(meter)) {
-      continue
-    }
-
-    const showsNote = showsNotes && meter.key !== CONTEXT_METER_KEY && meter.noteText !== ''
-
-    parts.push(
-      <Text key={meter.key}>
-        {parts.length === 0 ? '' : BAND_ITEM_GAP}
-        <Text dimColor>{meter.label} </Text>
-        {cells > 0 && meter.leftPercent !== null ? meterBar(kit, meter, cells) : null}
-        {cells > 0 && meter.leftPercent !== null ? ' ' : ''}
-        {meterValue(kit, meter)}
-        {showsNote ? <Text dimColor> · {meter.noteText}</Text> : null}
-      </Text>,
-    )
+  if (meter.severity === 'ok' || meter.leftPercent === null) {
+    return <Text>{meter.valueText}</Text>
   }
 
-  return <Text wrap="truncate-end">{parts}</Text>
+  return (
+    <Text color={SEVERITY_COLOR[meter.severity]} bold={meter.severity === 'danger'}>
+      {valueText(meter)}
+    </Text>
+  )
+}
+
+function bandMeters(kit: Kit, view: DashView, cells: number): RenderElement {
+  const { Text } = kit
+  const meters = view.meters.filter(meterVisibleInBand)
+  const layouts = bandLayouts()
+  const layout = layouts.find(one => rowCells(meters, one) <= cells) ?? layouts[layouts.length - 1]
+  const showsBar = (meter: MeterView) => (layout?.barCells ?? 0) > 0 && meter.leftPercent !== null
+
+  return (
+    <Text wrap="truncate-end">
+      {meters.map((meter, index) => (
+        <Text key={meter.key}>
+          {index === 0 ? '' : ITEM_GAP}
+          <Text dimColor>{meter.label} </Text>
+          {showsBar(meter) ? meterBar(kit, meter, layout?.barCells ?? 0) : null}
+          {showsBar(meter) ? ' ' : ''}
+          {meterValue(kit, meter)}
+          {layout?.noteKeys.includes(meter.key) && meter.noteText !== '' ? (
+            <Text color={meter.severity === 'ok' ? undefined : SEVERITY_COLOR[meter.severity]} dimColor={meter.severity === 'ok'}>
+              {NOTE_SEPARATOR}
+              {meter.noteText}
+            </Text>
+          ) : null}
+        </Text>
+      ))}
+    </Text>
+  )
 }
 
 function activeWorkers(view: DashView): WorkerView[] {
@@ -144,29 +203,29 @@ function workerCounts(view: DashView): string {
   const counts: string[] = []
 
   if (view.activeSubagents > 0) {
-    counts.push(`서브에이전트 ${view.activeSubagents}`)
+    counts.push(`${SUBAGENTS_LABEL} ${view.activeSubagents}`)
   }
 
-  if (view.activeTeammates > 0 || view.idleTeammates > 0) {
-    counts.push(`팀메이트 ${view.activeTeammates}/${view.activeTeammates + view.idleTeammates}`)
+  if (view.activeTeammates > 0) {
+    counts.push(`${TEAMMATES_LABEL} ${view.activeTeammates}/${view.teammates.length} 작업`)
   }
 
   if (view.tasks.length > 0) {
-    counts.push(`백그라운드 ${view.tasks.length}`)
+    counts.push(`${BACKGROUND_LABEL} ${view.tasks.length}`)
   }
 
-  return counts.join(' · ')
+  return counts.join(NOTE_SEPARATOR)
 }
 
 function workerName(worker: WorkerView): string {
-  return worker.kind === 'task' ? clip(worker.description, BAND_TASK_LABEL_CHARS) : worker.label
+  return clipCells(worker.kind === 'task' ? worker.description : worker.label, BAND_WORKER_NAME_CELLS)
 }
 
 function bandWorkers(kit: Kit, view: DashView): RenderElement | null {
   const { Text } = kit
   const workers = activeWorkers(view)
 
-  if (workers.length === 0 && view.idleTeammates === 0) {
+  if (workers.length === 0) {
     return null
   }
 
@@ -178,12 +237,30 @@ function bandWorkers(kit: Kit, view: DashView): RenderElement | null {
       <Text color="suggestion">{workerCounts(view)}</Text>
       {shown.map(worker => (
         <Text key={worker.id}>
-          {BAND_ITEM_GAP}
+          {ITEM_GAP}
           {workerName(worker)} <Text dimColor>{worker.ageText}</Text>
         </Text>
       ))}
-      {more > 0 ? <Text dimColor>{BAND_ITEM_GAP}+{more}</Text> : null}
+      {more > 0 ? (
+        <Text dimColor>
+          {ITEM_GAP}+{more}
+        </Text>
+      ) : null}
     </Text>
+  )
+}
+
+function bandStatus(kit: Kit, view: DashView, cells: number, trailing: RenderElement): RenderElement {
+  const { Box, Text } = kit
+  const { tokens } = view
+
+  return (
+    <Box flexDirection="row" flexShrink={0} gap={1} paddingLeft={1}>
+      {view.listError === null ? null : <Text color="warning">{WARNING_MARK}갱신 실패</Text>}
+      {cells >= BAND_TOKENS_MIN_CELLS ? <Text dimColor>토큰 {tokens.totalText}</Text> : null}
+      {cells >= BAND_COST_MIN_CELLS && tokens.costText !== null ? <Text dimColor>{tokens.costText}</Text> : null}
+      {cells >= BAND_BUTTON_MIN_CELLS ? trailing : null}
+    </Box>
   )
 }
 
@@ -194,24 +271,17 @@ export function bandTree(
   maxRows: number,
   trailing: RenderElement,
 ): RenderElement {
-  const { Box, Text } = kit
-  const { tokens } = view
+  const { Box } = kit
+  const cells = columns - BAND_INDENT
   const workers = maxRows >= BAND_ROWS_FULL ? bandWorkers(kit, view) : null
 
   return (
-    <Box flexDirection="column" width={columns}>
+    <Box flexDirection="column" width={columns} paddingLeft={BAND_INDENT}>
       <Box flexDirection="row" justifyContent="space-between">
         <Box flexShrink={1}>{headlineText(kit, view)}</Box>
-        <Box flexDirection="row" flexShrink={0} gap={1} paddingLeft={1}>
-          {view.listError === null ? null : <Text color="warning">⚠</Text>}
-          <Text dimColor>
-            토큰 {tokens.totalText}
-            {tokens.costText === null ? '' : ` · ${tokens.costText}`}
-          </Text>
-          {trailing}
-        </Box>
+        {bandStatus(kit, view, cells, trailing)}
       </Box>
-      {maxRows >= BAND_ROWS_TWO ? bandMeters(kit, view, columns) : null}
+      {maxRows >= BAND_ROWS_TWO ? bandMeters(kit, view, cells) : null}
       {workers}
     </Box>
   )
@@ -238,7 +308,12 @@ function paneMeter(kit: Kit, meter: MeterView, cells: number): RenderElement {
       </Box>
       <Text wrap="truncate-end">
         {meterBar(kit, meter, cells)} {meterValue(kit, meter)}
-        {meter.noteText === '' ? null : <Text dimColor> · {meter.noteText}</Text>}
+        {meter.noteText === '' ? null : (
+          <Text dimColor>
+            {NOTE_SEPARATOR}
+            {meter.noteText}
+          </Text>
+        )}
       </Text>
     </Box>
   )
@@ -281,21 +356,54 @@ function paneWorker(kit: Kit, worker: WorkerView): RenderElement {
   )
 }
 
-function paneWorkers(kit: Kit, title: string, summary: string, workers: readonly WorkerView[]): RenderElement {
+function paneWorkers(
+  kit: Kit,
+  title: string,
+  summary: string,
+  workers: readonly WorkerView[],
+  footer: string,
+): RenderElement {
   const { Box, Text } = kit
+
+  if (workers.length === 0 && footer === '') {
+    return (
+      <Box marginTop={1}>
+        <Text>
+          <Text bold>{title}</Text>
+          <Text dimColor> 없음</Text>
+        </Text>
+      </Box>
+    )
+  }
 
   return (
     <Box flexDirection="column" marginTop={1}>
       {paneSectionTitle(kit, title, summary)}
-      {workers.length === 0 ? <Text dimColor>  없음</Text> : workers.map(worker => paneWorker(kit, worker))}
+      {workers.map(worker => paneWorker(kit, worker))}
+      {footer === '' ? null : <Text dimColor>{footer}</Text>}
     </Box>
   )
+}
+
+function finishedSummary(view: DashView): string {
+  const parts: string[] = []
+
+  if (view.doneSubagents > 0) {
+    parts.push(`완료 ${view.doneSubagents}`)
+  }
+
+  if (view.failedSubagents > 0) {
+    parts.push(`실패 ${view.failedSubagents}`)
+  }
+
+  return parts.join(NOTE_SEPARATOR)
 }
 
 export function paneTree(kit: Kit, view: DashView, columns: number): RenderElement {
   const { Box, Text } = kit
   const { tokens } = view
   const cells = columns >= PANE_COLUMNS_WIDE ? PANE_BAR_CELLS_WIDE : PANE_BAR_CELLS_NARROW
+  const runningSubagents = view.subagents.filter(worker => worker.isActive)
   const teammateSummary = view.teammates.length === 0 ? '' : `${view.activeTeammates} 작업 중 · ${view.idleTeammates} 유휴`
 
   return (
@@ -303,7 +411,7 @@ export function paneTree(kit: Kit, view: DashView, columns: number): RenderEleme
       {headlineText(kit, view)}
       {view.listError === null ? null : (
         <Text color="warning" wrap="truncate-end">
-          ⚠ 에이전트 목록을 읽지 못했습니다: {view.listError}
+          {WARNING_MARK}에이전트 목록을 읽지 못했습니다: {view.listError}
         </Text>
       )}
       <Box flexDirection="column" marginTop={1}>
@@ -317,12 +425,18 @@ export function paneTree(kit: Kit, view: DashView, columns: number): RenderEleme
           입력 {tokens.inputText} · 출력 {tokens.outputText} · 캐시 읽기 {tokens.cacheReadText} · 캐시 쓰기 {tokens.cacheWriteText}
         </Text>
         <Text dimColor wrap="truncate-end">
-          메인 {tokens.mainText} · 서브에이전트 {tokens.agentsText}
+          메인 {tokens.mainText} · 에이전트 {tokens.agentsText}
         </Text>
       </Box>
-      {paneWorkers(kit, '서브에이전트', view.activeSubagents === 0 ? '' : `${view.activeSubagents} 실행 중`, view.subagents)}
-      {paneWorkers(kit, '팀메이트', teammateSummary, view.teammates)}
-      {paneWorkers(kit, '백그라운드', view.tasks.length === 0 ? '' : `${view.tasks.length} 실행 중`, view.tasks)}
+      {paneWorkers(
+        kit,
+        SUBAGENTS_LABEL,
+        runningSubagents.length === 0 ? '' : `${runningSubagents.length} ${RUNNING_TEXT}`,
+        runningSubagents,
+        finishedSummary(view),
+      )}
+      {paneWorkers(kit, TEAMMATES_LABEL, teammateSummary, view.teammates, '')}
+      {paneWorkers(kit, BACKGROUND_LABEL, view.tasks.length === 0 ? '' : `${view.tasks.length} ${RUNNING_TEXT}`, view.tasks, '')}
     </Box>
   )
 }

@@ -6,11 +6,14 @@ import {
   agentsFromReading,
   barCells,
   buildView,
+  cellWidth,
+  clipCells,
+  exhaustsBeforeReset,
   emptyTokens,
   formatCost,
   formatDuration,
   formatTokens,
-  parseTaskNotificationId,
+  endedTaskIds,
   tasksFromReading,
   usageFromReading,
   withKnownLimits,
@@ -47,6 +50,8 @@ describe('formatting', () => {
     expect(formatTokens(1_000_000)).toBe('1M')
     expect(formatTokens(1_234_567)).toBe('1.23M')
     expect(formatTokens(12_340_000)).toBe('12.3M')
+    expect(formatTokens(999_600)).toBe('1M')
+    expect(formatTokens(999_960_000)).toBe('1B')
   })
 
   test('durations shorten as they grow', () => {
@@ -74,11 +79,14 @@ describe('formatting', () => {
 })
 
 describe('readings', () => {
-  test('a notification names its task', () => {
-    const text = '<task-notification>\n<task-id>bvcykn48s</task-id>\n<status>completed</status>'
+  test('a notification names the tasks it ends, and only those', () => {
+    const one = '<task-notification>\n<task-id>bvcykn48s</task-id>\n<status>completed</status>\n</task-notification>'
+    const event = '<task-notification><task-id>mon-1</task-id><status>event</status></task-notification>'
+    const failed = '<task-notification><task-id>sh-2</task-id><status>failed</status></task-notification>'
 
-    expect(parseTaskNotificationId(text)).toBe('bvcykn48s')
-    expect(parseTaskNotificationId('plain prompt')).toBeNull()
+    expect(endedTaskIds(one)).toEqual(['bvcykn48s'])
+    expect(endedTaskIds(`${one}\n${event}\n${failed}`)).toEqual(['bvcykn48s', 'sh-2'])
+    expect(endedTaskIds('plain prompt')).toEqual([])
   })
 
   test('a missing reading stays missing, not zero', () => {
@@ -111,22 +119,25 @@ describe('readings', () => {
   })
 
   test('agent loops in background_tasks are left to the agent list', () => {
-    const previous: DashTask[] = [{ id: 'sh', kind: 'shell', label: 'npm test', startedAt: 5 }]
+    const previous: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5 }]
 
     const tasks = tasksFromReading(
       [
         { id: 'sh', type: 'shell', description: 'Run tests', command: 'npm test' },
         { id: 'ag', type: 'subagent', description: 'list files' },
-        { id: 'tm', type: 'teammate', description: 'scout' },
+        { id: 'tm', type: 'in_process_teammate', description: 'scout' },
         { id: 'mo', type: 'monitor', description: 'watch CI' },
+        { id: 'sh2', type: 'shell', description: '', command: 'sleep 9' },
       ],
       previous,
+      new Set(['tm']),
       50,
     )
 
     expect(tasks).toEqual([
-      { id: 'sh', kind: 'shell', label: 'npm test', startedAt: 5 },
-      { id: 'mo', kind: 'monitor', label: 'watch CI', startedAt: 50 },
+      { id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5 },
+      { id: 'mo', kind: 'monitor', description: 'watch CI', startedAt: 50 },
+      { id: 'sh2', kind: 'shell', description: 'sleep 9', startedAt: 50 },
     ])
   })
 
@@ -150,13 +161,13 @@ describe('headline', () => {
       }),
     )
 
-    expect(view.headline).toEqual({ phase: 'needs-input', title: '입력 필요', detail: '질문에 답해 주세요', elapsedText: '5s' })
+    expect(view.headline).toEqual({ phase: 'needs-input', title: '입력 필요', detail: '질문', elapsedText: '5s' })
   })
 
   test('plan approval reads as its own wait', () => {
     const view = buildView(snapshot({ asks: [{ id: 'p', tool: 'ExitPlanMode', startedAt: NOW }] }))
 
-    expect(view.headline.detail).toBe('계획 승인을 기다립니다')
+    expect(view.headline.detail).toBe('계획 승인')
   })
 
   test('a running turn names the tools in flight', () => {
@@ -169,7 +180,7 @@ describe('headline', () => {
       phase: 'working',
       title: '응답 중',
       detail: '생각 중',
-      elapsedText: '1m12s',
+      elapsedText: '',
     })
     expect(buildView(snapshot({ isWorking: true, turn: { ...RUNNING_TURN, calls } })).headline.detail).toBe(
       'Bash 외 1개 실행 중',
@@ -190,10 +201,10 @@ describe('headline', () => {
       listError: null,
     }
 
-    const tasks: DashTask[] = [{ id: 'sh', kind: 'shell', label: 'npm test', startedAt: NOW }]
+    const tasks: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: NOW }]
 
     expect(buildView(snapshot({ live })).headline.title).toBe('서브에이전트 대기')
-    expect(buildView(snapshot({ live, tasks })).headline.title).toBe('서브에이전트·백그라운드 대기')
+    expect(buildView(snapshot({ live, tasks })).headline.title).toBe('서브에이전트, 백그라운드 대기')
     expect(buildView(snapshot({ tasks })).headline.title).toBe('백그라운드 대기')
   })
 
@@ -218,7 +229,7 @@ describe('headline', () => {
     expect(ended('aborted').title).toBe('중단됨')
     expect(ended('error').phase).toBe('error')
     expect(ended('refusal').title).toBe('응답 거부됨')
-    expect(buildView(snapshot({})).headline.title).toBe('대기 중')
+    expect(buildView(snapshot({})).headline.title).toBe('준비됨')
   })
 })
 
@@ -277,6 +288,26 @@ describe('meters', () => {
     const later = buildView(snapshot({ lastTurn: { reason: 'answer', endedAt: NOW - 276_000, durationMs: 3_000 } }))
 
     expect(later.headline.detail).toBe('4m 전 · 3s 소요')
+  })
+
+  test('a window spent faster than it resets warns before the percentage would', () => {
+    const fiveHour = { kind: 'five_hour', percentUsed: 47, resetsAt: NOW + 199 * 60_000 }
+    const early = { kind: 'five_hour', percentUsed: 30, resetsAt: NOW + (5 * 60 - 10) * 60_000 }
+    const steady = { kind: 'seven_day', percentUsed: 10, resetsAt: NOW + 5 * 86_400_000 }
+
+    expect(Math.round((exhaustsBeforeReset(fiveHour, NOW) ?? 0) / 60_000)).toBe(114)
+    expect(exhaustsBeforeReset(early, NOW)).toBeNull()
+    expect(exhaustsBeforeReset(steady, NOW)).toBeNull()
+
+    const [, meter] = buildView(snapshot({ usage: { ...usage, limits: [fiveHour] }, hasResponse: true })).meters
+
+    expect(meter).toMatchObject({ severity: 'warn', noteText: '이 속도면 1h53m 후 소진' })
+  })
+
+  test('display width counts Hangul as two cells', () => {
+    expect(cellWidth('5시간 47%')).toBe(9)
+    expect(clipCells('서브에이전트 작업', 9)).toBe('서브에이…')
+    expect(clipCells('short', 9)).toBe('short')
   })
 
   test('an extra window the API reports is kept for the pane', () => {

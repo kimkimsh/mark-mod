@@ -27,13 +27,13 @@ Priority order; the first that holds is the headline.
 
 | State | Holds when | Colour |
 |---|---|---|
-| 입력 필요 (needs you) | `AskUserQuestion` or `ExitPlanMode` is in flight | warning |
-| 응답 중 (working) | the main loop has a turn running | claude |
-| 서브에이전트 / 팀메이트 / 백그라운드 대기 | main loop idle, but subagents running, teammates working, or background tasks in flight (several may hold; the label names all that do) | suggestion |
+| 입력 필요 (needs you) | `AskUserQuestion` (질문) or `ExitPlanMode` (계획 승인) is in flight; shows how long it has waited | warning |
+| 응답 중 (working) | the main loop has a turn running; shows the tool in flight (the engine's spinner already shows the elapsed time) | claude |
+| 서브에이전트 / 팀메이트 / 백그라운드 대기 | main loop idle, but subagents running, teammates working, or background tasks in flight (several may hold; the label names all that do, comma-separated) | suggestion |
 | 전체 완료 (all done) | nothing running, last turn answered | success |
 | 중단됨 (interrupted) | nothing running, last turn aborted | inactive |
 | 오류 (error) | nothing running, last turn ended by an API error or a refusal | error |
-| 대기 중 (ready) | no turn yet this session | inactive |
+| 준비됨 (ready) | no turn yet this session | inactive |
 
 Not detected: the permission dialog. The engine raises `classic.PermissionRequest`
 when it opens but nothing when it closes, so after an approval the state could
@@ -53,10 +53,17 @@ band would be.
   reading is stale: the meter reads "리셋됨" until the next response refreshes it.
 - **`background_tasks` absent ≠ empty.** An older build leaves the field out;
   reconciliation then does nothing rather than clearing the list.
-- **Agent list pull fails** → the previous list stays and the pane and band
-  show a warning mark with the error text. The 1 s tick is the retry.
+- **Agent list pull fails** → the previous list stays; the band shows
+  "⚠ 갱신 실패" and the pane the error text. The 1 s tick is the retry.
 - **One pull at a time.** The tick and the event hooks share a single-flight
-  refresh, so a slow `$.agent.list()` cannot overwrite a newer one.
+  refresh, so a slow `$.agent.list()` cannot overwrite a newer one. Hooks never
+  await it, so a slow list cannot hold up a turn.
+- **A notification ends a task only by saying so.** A task-notification removes
+  its task when its status is completed, failed or killed; any other word (a
+  monitor's event) leaves it to the Stop snapshot. One prompt may carry several.
+- **The Stop snapshot is the truth** about background work in flight, minus the
+  agent loops `$.agent.list()` already shows (type `subagent`, or an id the list
+  names). A known task keeps the name and start time it was first drawn with.
 - **Stale main turn.** The band trusts the engine's `isWorking` over the turn
   record, so a missed `turn.complete` cannot pin "working" on screen.
 
@@ -75,31 +82,44 @@ Each request is counted once; `turn.complete` totals are never added.
 
 ## Persistence
 
-`$.state` survives a hot reload. Token totals are also written to `$.store`
-(key `sessions`, one entry per session id) at every loop's turn end and at
-session end, so `claude --resume` continues the count (verified: a resumed
-session keeps its id). The store keeps the 30 most recent sessions, and an
-entry that does not decode is dropped rather than trusted. `/clear` starts a
-new session: tokens, turn record and last result reset.
+`$.state` survives a hot reload. Token totals are also written to `$.store`,
+one key per session (`tokens:<id>`, since concurrent Claude processes share the
+store), at every loop's turn end and at session end; saves run one at a time
+so a later total is never overwritten by an earlier one. `claude --resume`
+continues the count (verified: a resumed session keeps its id). `/clear` and an
+in-process `/resume` raise `session.end` and then `classic.SessionStart` with
+no `session.start`: the ending session is saved and its conversation state
+cleared (tokens, turn record, last result, context and cost; rate-limit
+windows stay), and the next session's saved total is loaded. The store keeps
+the 30 most recent sessions; an entry that does not decode is dropped rather
+than trusted.
 
 Tokens spent before the mod loaded in a session are not counted.
 
 ## Layout
 
-Band (2–3 rows, width = `props.bodyColumns`):
+Band (2–3 rows, width = `props.bodyColumns`, indented two cells to line up
+with the engine's footer), as captured from a live session:
 
 ```
-● 응답 중  Bash 실행 중 · 1m12s                         토큰 1.23M · $3.41  /dash
-컨텍스트 ███▌░░░░░░ 46%   5시간 ██▍░░░░░░░ 77% 남음 · 2h14m   주간 █▎░░░░░░░░ 88% 남음 · 3d4h
-서브에이전트 2 · 팀메이트 1/3 · 백그라운드 1   Explore 42s · general-purpose 1m03s · npm test 5m
+  ● 응답 중  생각 중                                                       토큰 1.09M $0.14 /dash
+  컨텍스트 ████████▉░ 89% 남음   5시간 ████▌░░░░░ 45% 남음 · 이 속도면 1h35m 후 소진   주간 ████████▎░ 82% 남음 · 6d5h 후 리셋
+  서브에이전트 1 · 백그라운드 1   Explore 6s   Run sleep 40 6s
 ```
 
 Every meter is a fuel gauge: the bar is what is **left**, the number beside it
-is the same amount, and the colour turns warning at 40% left and error at 15%
-left. Narrower bands shrink the bars, then drop them, then drop the reset
-notes; the third row appears only while something runs.
+is the same amount. Healthy gauges are grey; warning at 40% left or when the
+window is on pace to run out before its reset (linear projection, not before
+15 min of a 5-hour window or 2 days of a week); error with a `⚠` at 15% left.
 
-Pane: the same three blocks expanded, one row per agent/task.
+Width is spent by priority, measured in terminal cells (Hangul is two): the
+three values always; then the 5-hour reset note, the weekly reset note, and
+the bars (10 cells, else 6). On row 1 the title is never cut; the right-hand
+group drops `/dash`, then cost, then tokens. The third row appears only while
+something runs.
+
+Pane: the same three blocks expanded, one row per running agent/task; finished
+subagents fold into one line (`완료 3 · 실패 1`); an empty group is one line.
 
 ## Files
 

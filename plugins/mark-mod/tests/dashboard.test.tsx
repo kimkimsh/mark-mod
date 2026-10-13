@@ -4,6 +4,8 @@ import type { AgentInfo, On, RenderSurface, SessionUsage, TurnStepInput } from '
 
 const PLUGIN = 'mark-mod'
 
+const PANE_ID = PLUGIN
+
 const SESSION_ID = 'session-1'
 
 const START = 1_800_000_000_000
@@ -60,6 +62,16 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
   })
 
   return world
+}
+
+function savedTokens(input: number) {
+  return {
+    savedAt: START,
+    tokens: {
+      main: { input, output: 0, cacheRead: 0, cacheWrite: 0 },
+      agents: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+  }
 }
 
 async function start($: Engine): Promise<void> {
@@ -126,7 +138,7 @@ describe('band', () => {
       const ui = await band($, surface, false, 140, 5)
       const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-      expect(text).toContain('대기 중')
+      expect(text).toContain('준비됨')
       expect(text).toContain('측정 전')
       expect(await ui.find({ type: 'Button', key: 'dash' })).toBeDefined()
       await ui.unmount()
@@ -144,6 +156,20 @@ describe('band', () => {
     expect(text).toContain('2h00m 후 리셋')
     expect(text).toContain('87% 남음')
     expect(text).toContain('$3.41')
+  })
+
+  test('after /clear the account\'s limits stay on screen, the conversation\'s figures do not', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    on('classic.SessionStart', () => ({}))
+    await start($)
+    await measure($, world)
+    await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+    await $.classic.SessionStart({ source: 'clear', session_id: 'session-2' })
+    const text = await bandText($, false, 140)
+
+    expect(text).toContain('67% 남음')
+    expect(text).not.toContain('$3.41')
+    expect(text).toContain('컨텍스트 측정 전')
   })
 
   test('a window whose reset time passed stops claiming its old reading', async ($, on) => {
@@ -179,7 +205,7 @@ describe('band', () => {
     const text = await bandText($, true, 140)
 
     expect(text).toContain('입력 필요')
-    expect(text).toContain('계획 승인을 기다립니다')
+    expect(text).toContain('계획 승인')
 
     release()
     await asking
@@ -263,6 +289,22 @@ describe('band', () => {
     expect(await bandText($, false, 140)).not.toContain('백그라운드')
   })
 
+  test('a notification that does not end its task leaves it running', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: { taskId: 'mon-1', timeoutMs: 0, persistent: true } }))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+    await start($)
+    await $.tool.call({ tool: 'Monitor', tool_use_id: 'm1', description: 'watch CI', timeout_ms: 0 })
+    await $.prompt.submit({
+      text: '<task-notification><task-id>mon-1</task-id><status>event</status></task-notification>',
+      wait: false,
+      origin: { kind: 'task-notification' },
+    })
+    await world.clock.advance(1_000)
+
+    expect(await bandText($, false, 140)).toContain('watch CI')
+  })
+
   test('the stop snapshot is the truth about what still runs', async ($, on) => {
     boot(on, SESSION_ID)
     on('classic.Stop', () => ({}))
@@ -299,7 +341,7 @@ describe('band', () => {
     const ui = await band($, 'terminal', false, 140, 1)
     const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-    expect(text).toContain('대기 중')
+    expect(text).toContain('준비됨')
     expect(text).not.toContain('컨텍스트')
   })
 
@@ -320,6 +362,56 @@ describe('band', () => {
     })
 
     expect(await ui.find({ type: 'Button', key: 'dash' })).toBeUndefined()
+  })
+})
+
+describe('band layout', () => {
+  test('values come first; the weekly reset note and the bars give way to width', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await measure($, world)
+
+    const wide = await bandText($, false, 140)
+
+    expect(wide).toContain('█')
+    expect(wide).toContain('2h00m 후 리셋')
+    expect(wide).toContain('6d0h 후 리셋')
+
+    const medium = await bandText($, false, 74)
+
+    expect(medium).not.toContain('█')
+    expect(medium).toContain('2h00m 후 리셋')
+    expect(medium).not.toContain('6d0h 후 리셋')
+    expect(medium).toContain('87% 남음')
+
+    const narrow = await bandText($, false, 50)
+
+    expect(narrow).not.toContain('후 리셋')
+    expect(narrow).toContain('87% 남음')
+    expect(narrow).not.toContain('/dash')
+  })
+
+  test('only idle teammates leave no worker row', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.agents = [
+      { id: 't2', teammateId: 'critic@team', name: 'critic', description: 'review', type: 'teammate', status: 'idle' },
+    ]
+    await world.clock.advance(1_000)
+
+    expect(await bandText($, false, 140)).not.toContain('팀메이트')
+  })
+
+  test('a limit on pace to run out before its reset warns ahead of time', async ($, on) => {
+    boot(on, SESSION_ID)
+    await start($)
+    await $.session.measure({
+      context: { tokens: 10_000, window: 200_000, percent: 5 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: 47, resetsAt: new Date(START + 199 * 60_000).toISOString() }],
+      changed: ['rateLimits'],
+    })
+
+    expect(await bandText($, false, 140)).toContain('이 속도면 1h53m 후 소진')
   })
 })
 
@@ -348,17 +440,7 @@ describe('tokens', () => {
   })
 
   test('a resumed session continues its saved count; /clear starts over', async ($, on) => {
-    const saved = {
-      sessions: {
-        [SESSION_ID]: {
-          savedAt: START,
-          tokens: {
-            main: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 },
-            agents: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          },
-        },
-      },
-    }
+    const saved = { [`tokens:${SESSION_ID}`]: savedTokens(1_000_000) }
 
     boot(on, SESSION_ID, saved)
     await start($)
@@ -370,8 +452,44 @@ describe('tokens', () => {
     expect(await bandText($, false, 140)).toContain('토큰 0')
   })
 
+  test('switching to another session in the same process loads that session\'s count', async ($, on) => {
+    boot(on, SESSION_ID, { 'tokens:session-2': savedTokens(2_000_000) })
+    on('classic.SessionStart', () => ({}))
+    await start($)
+    await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+    await $.classic.SessionStart({ source: 'resume', session_id: 'session-2' })
+
+    expect(await bandText($, false, 140)).toContain('토큰 2M')
+  })
+
+  test('a session saved on the way out is found again when it comes back', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('classic.SessionStart', () => ({}))
+    on('turn.step', async function* () {
+      yield* []
+
+      return {
+        turnId: 'turn-1',
+        index: 0,
+        answer: '',
+        toolUses: [],
+        stopReason: 'end_turn',
+        usage: { input_tokens: 5, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' },
+      }
+    })
+    await start($)
+    await step($, undefined)
+    await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+
+    expect(await bandText($, false, 140)).toContain('토큰 0')
+
+    await $.classic.SessionStart({ source: 'resume', session_id: SESSION_ID })
+
+    expect(await bandText($, false, 140)).toContain('토큰 10')
+  })
+
   test('a store written by something else is ignored, not trusted', async ($, on) => {
-    boot(on, SESSION_ID, { sessions: { [SESSION_ID]: { tokens: 'lots' } } })
+    boot(on, SESSION_ID, { [`tokens:${SESSION_ID}`]: { tokens: 'lots' } })
     await start($)
 
     expect(await bandText($, false, 140)).toContain('토큰 0')
@@ -384,7 +502,7 @@ describe('pane', () => {
     await start($)
     await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
 
-    expect(world.openPanes).toEqual(['mark-mod'])
+    expect(world.openPanes).toEqual([PANE_ID])
 
     await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
 
@@ -397,7 +515,7 @@ describe('pane', () => {
     const ui = await band($, 'terminal', false, 140, 5)
     await ui.press({ key: 'dash' })
 
-    expect(world.openPanes).toEqual(['mark-mod'])
+    expect(world.openPanes).toEqual([PANE_ID])
   })
 
   test('the pane itemises usage, tokens and every worker', async ($, on) => {
@@ -421,7 +539,7 @@ describe('pane', () => {
           plugin: PLUGIN,
           surface,
           component: 'Pane',
-          requestId: 'mark-mod',
+          requestId: PANE_ID,
           props: {
             title: '세션 현황',
             isFocused: false,
@@ -434,7 +552,7 @@ describe('pane', () => {
 
         const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-        for (const expected of ['사용량', '컨텍스트', '5시간', '주간', '토큰', '$3.41', 'Explore', '↳ general-purpose', '완료', 'npm test', '팀메이트', '없음']) {
+        for (const expected of ['사용량', '컨텍스트', '5시간', '주간', '토큰', '$3.41', 'Explore', '완료 1', 'Run tests', '팀메이트 없음']) {
           expect(text).toContain(expected)
         }
 
@@ -452,7 +570,7 @@ describe('pane', () => {
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('⚠')
+    expect(text).toContain('⚠ 갱신 실패')
     expect(text).toContain('서브에이전트 대기')
   })
 })

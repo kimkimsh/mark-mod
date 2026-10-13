@@ -1,23 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
 
-import type { DashCall, DashCounts, DashLive, DashTask, DashTokens } from '../types'
+import type { DashAgent, DashCall, DashCounts, DashTask, DashTokens, DashUsage } from '../types'
 import {
   addTokens,
   agentsFromReading,
   buildView,
   emptyTokens,
+  endedTaskIds,
   isAgentActive,
   isAskingTool,
   isTokensEmpty,
-  parseTaskNotificationId,
   tasksFromReading,
   usageFromReading,
   withKnownLimits,
   withTask,
+  withoutConversation,
   withoutTask,
+  withoutTasks,
 } from './model'
-import type { DashSnapshot, TaskReading, UsageCounts } from './model'
+import type { DashSnapshot, TaskReading, UsageCounts, UsageReading } from './model'
 import { bandTree, paneTree } from './view'
 
 const PANE_ID = 'mark-mod'
@@ -32,9 +34,9 @@ const TICK_MS = 1000
 // session costs one state write per step instead of one per tick.
 const IDLE_CLOCK_STEP_MS = 30_000
 
-const LIVE_WRITE_ATTEMPTS = 3
-
-const STORE_KEY = 'sessions'
+// One $.store key per session: concurrent Claude processes share the store,
+// and a single map rewritten by each of them would lose the others' saves.
+const STORE_PREFIX = 'tokens:'
 
 const STORE_SESSIONS_KEPT = 30
 
@@ -56,11 +58,17 @@ const usageAtom = atom({ plugin: 'mark-mod', key: 'usage' } as const, null)
 
 const liveAtom = atom({ plugin: 'mark-mod', key: 'live' } as const, { now: 0, agents: [], listError: null })
 
-const liveRef = { plugin: 'mark-mod', key: 'live' } as const
-
 type SavedSession = { tokens: DashTokens; savedAt: number }
 
-type SavedSessions = Record<string, SavedSession>
+// The last usage written, kept outside $.state: after a /clear the session's
+// values start empty, and the rate-limit windows, which are the account's,
+// would read "not measured" until the next response.
+let lastUsage: DashUsage | null = null
+
+async function writeUsage($: EngineInterface, reading: UsageReading): Promise<void> {
+  const usage = await update($, usageAtom, previous => withKnownLimits(previous ?? lastUsage, usageFromReading(reading)))
+  lastUsage = usage
+}
 
 const COUNT_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite']
 
@@ -71,6 +79,8 @@ function isCounts(value: unknown): value is DashCounts {
   )
 }
 
+// $.store outlives this code: an entry another version wrote is dropped
+// rather than trusted.
 function isSavedSession(value: unknown): value is SavedSession {
   if (!(value instanceof Object)) {
     return false
@@ -86,16 +96,25 @@ function isSavedSession(value: unknown): value is SavedSession {
   )
 }
 
-// $.store outlives this code: a value an older version wrote is dropped
-// rather than trusted.
-function isSavedSessions(value: unknown): value is SavedSessions {
-  return value instanceof Object && !Array.isArray(value) && Object.values(value).every(isSavedSession)
-}
+async function pruneSessions($: EngineInterface): Promise<void> {
+  const keys = (await $.store.keys()).filter(key => key.startsWith(STORE_PREFIX))
 
-async function loadSessions($: EngineInterface): Promise<SavedSessions> {
-  const stored = await $.store.get(STORE_KEY)
+  if (keys.length <= STORE_SESSIONS_KEPT) {
+    return
+  }
 
-  return isSavedSessions(stored) ? stored : {}
+  const dated: { key: string; savedAt: number }[] = []
+
+  for (const key of keys) {
+    const saved = await $.store.get(key)
+    dated.push({ key, savedAt: isSavedSession(saved) ? saved.savedAt : 0 })
+  }
+
+  dated.sort((a, b) => b.savedAt - a.savedAt)
+
+  for (const stale of dated.slice(STORE_SESSIONS_KEPT)) {
+    await $.store.delete(stale.key)
+  }
 }
 
 async function saveTokens($: EngineInterface, sessionId: string): Promise<void> {
@@ -105,33 +124,36 @@ async function saveTokens($: EngineInterface, sessionId: string): Promise<void> 
     return
   }
 
-  const sessions = await loadSessions($)
-
-  const kept = Object.entries(sessions)
-    .filter(([id]) => id !== sessionId)
-    .sort(([, a], [, b]) => b.savedAt - a.savedAt)
-    .slice(0, STORE_SESSIONS_KEPT - 1)
-
-  const next: SavedSessions = Object.fromEntries(kept)
-  next[sessionId] = { tokens, savedAt: await $.clock.now() }
-  await $.store.set(STORE_KEY, next)
+  await $.store.set(STORE_PREFIX + sessionId, { tokens, savedAt: await $.clock.now() })
+  await pruneSessions($)
 }
 
-async function seedTokens($: EngineInterface): Promise<void> {
+let saveChain: Promise<void> = Promise.resolve()
+
+// Saves run one after another, so a slower earlier save can never land after
+// a later one and leave a smaller total in the store.
+function queueSave($: EngineInterface, sessionId: string): Promise<void> {
+  const save = saveChain.then(() => saveTokens($, sessionId))
+  saveChain = save.catch(() => undefined)
+
+  return save
+}
+
+async function seedTokens($: EngineInterface, sessionId: string): Promise<void> {
   if (!isTokensEmpty(await read($, tokensAtom))) {
     return
   }
 
-  const saved = (await loadSessions($))[await $.session.id()]
+  const saved = await $.store.get(STORE_PREFIX + sessionId)
 
-  if (saved !== undefined) {
+  if (isSavedSession(saved)) {
     await update($, tokensAtom, current => (isTokensEmpty(current) ? saved.tokens : current))
   }
 }
 
-async function isAnythingRunning($: EngineInterface, live: DashLive): Promise<boolean> {
+async function isAnythingRunning($: EngineInterface, agents: readonly DashAgent[]): Promise<boolean> {
   return (
-    live.agents.some(agent => isAgentActive(agent.status)) ||
+    agents.some(agent => isAgentActive(agent.status)) ||
     (await read($, turnAtom)) !== null ||
     (await read($, asksAtom)).length > 0 ||
     (await read($, tasksAtom)).length > 0
@@ -142,6 +164,7 @@ function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
 }
 
+// The only writer of `live`; requestRefresh keeps it to one run at a time.
 async function refreshLive($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   let listed: Awaited<ReturnType<EngineInterface['agent']['list']>> | null = null
@@ -149,28 +172,18 @@ async function refreshLive($: EngineInterface): Promise<void> {
 
   try {
     listed = await $.agent.list()
-  } catch (error) {
+  } catch (cause) {
     // Degrade to the last list and say so on screen; the next tick asks again.
-    listError = errorText(error)
+    listError = errorText(cause)
   }
 
-  for (let attempt = 0; attempt < LIVE_WRITE_ATTEMPTS; attempt += 1) {
-    const held = await $.state.get(liveRef)
-    const previous = held.value ?? liveAtom.initial
-    const agents = listed === null ? previous.agents : agentsFromReading(listed, previous.agents, now)
-    const draft: DashLive = { now, agents, listError }
-    const clock = (await isAnythingRunning($, draft)) ? now : now - (now % IDLE_CLOCK_STEP_MS)
-    const next: DashLive = { now: clock, agents, listError }
+  const previous = await read($, liveAtom)
+  const agents = listed === null ? previous.agents : agentsFromReading(listed, previous.agents, now)
+  const clock = (await isAnythingRunning($, agents)) ? now : now - (now % IDLE_CLOCK_STEP_MS)
+  const next = { now: clock, agents, listError }
 
-    if (JSON.stringify(next) === JSON.stringify(previous)) {
-      return
-    }
-
-    const written = await $.state.set(liveRef, next, { ifVersion: held.version })
-
-    if (written.isSet) {
-      return
-    }
+  if (JSON.stringify(next) !== JSON.stringify(previous)) {
+    await update($, liveAtom, () => next)
   }
 }
 
@@ -186,19 +199,18 @@ async function drainRefreshes($: EngineInterface): Promise<void> {
 }
 
 // One pull at a time: the ticker and the event hooks both ask, and a slow
-// $.agent.list() answered after a newer one must not overwrite it.
-function requestRefresh($: EngineInterface): Promise<void> {
+// $.agent.list() answered after a newer one must not overwrite it. Hooks
+// never await this, so a slow list cannot hold up a turn.
+function requestRefresh($: EngineInterface): void {
   if (refreshInFlight !== null) {
     isRefreshQueued = true
 
-    return refreshInFlight
+    return
   }
 
   refreshInFlight = drainRefreshes($).finally(() => {
     refreshInFlight = null
   })
-
-  return refreshInFlight
 }
 
 async function addCall($: EngineInterface, e: ToolCallInput): Promise<DashCall> {
@@ -227,8 +239,14 @@ async function removeCall($: EngineInterface, call: DashCall, isMainLoop: boolea
   }
 }
 
-async function addTask($: EngineInterface, id: string, kind: string, label: string): Promise<void> {
-  const task: DashTask = { id, kind, label, startedAt: await $.clock.now() }
+function isAnswered<R extends { deny?: string; isError?: true }>(
+  ran: R,
+): ran is Exclude<R, { deny: string } | { isError: true }> {
+  return ran.deny === undefined && ran.isError !== true
+}
+
+async function addTask($: EngineInterface, id: string, kind: string, description: string): Promise<void> {
+  const task: DashTask = { id, kind, description, startedAt: await $.clock.now() }
   await update($, tasksAtom, tasks => withTask(tasks, task))
 }
 
@@ -247,23 +265,25 @@ async function reconcileTasks($: EngineInterface, readings: readonly TaskReading
   }
 
   const now = await $.clock.now()
-  await update($, tasksAtom, tasks => tasksFromReading(readings, tasks, now))
+  const agentIds = new Set((await read($, liveAtom)).agents.map(agent => agent.id))
+  await update($, tasksAtom, tasks => tasksFromReading(readings, tasks, agentIds, now))
 }
 
-async function snapshotOf($: EngineInterface, isWorking: boolean | null): Promise<DashSnapshot> {
-  const turn = await read($, turnAtom)
+// What the turn record says; the band replaces isWorking with the engine's
+// own AbovePrompt prop.
+async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
+  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live] = await Promise.all([
+    read($, turnAtom),
+    read($, asksAtom),
+    read($, tasksAtom),
+    read($, tokensAtom),
+    read($, hasResponseAtom),
+    read($, lastTurnAtom),
+    read($, usageAtom),
+    read($, liveAtom),
+  ])
 
-  return {
-    isWorking: isWorking ?? turn !== null,
-    turn,
-    asks: await read($, asksAtom),
-    tasks: await read($, tasksAtom),
-    tokens: await read($, tokensAtom),
-    hasResponse: await read($, hasResponseAtom),
-    lastTurn: await read($, lastTurnAtom),
-    usage: await read($, usageAtom),
-    live: await read($, liveAtom),
-  }
+  return { isWorking: turn !== null, turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live }
 }
 
 async function togglePane($: EngineInterface): Promise<string | null> {
@@ -280,40 +300,52 @@ async function togglePane($: EngineInterface): Promise<string | null> {
   return opened.isPlaced ? null : opened.reason
 }
 
+// Rate-limit windows are the account's and stay; everything that belongs to
+// the conversation starts over.
 async function resetConversation($: EngineInterface): Promise<void> {
   await update($, tokensAtom, () => emptyTokens())
   await update($, turnAtom, () => null)
   await update($, asksAtom, () => [])
   await update($, lastTurnAtom, () => null)
   await update($, hasResponseAtom, () => false)
+  await update($, usageAtom, usage => (usage === null ? usage : withoutConversation(usage)))
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: COMMAND, description: '세션 현황 패널을 열거나 닫습니다' })
+    await refreshLive($)
     $.clock.every(TICK_MS, () => {
-      void requestRefresh($)
+      requestRefresh($)
     })
-    await requestRefresh($)
-    await seedTokens($)
-    const usage = await $.session.usage()
-    await update($, usageAtom, previous => withKnownLimits(previous, usageFromReading(usage)))
+    await seedTokens($, await $.session.id())
+    await writeUsage($, await $.session.usage())
 
     return next(e)
   })
 
+  // /clear and an in-process /resume end one conversation and go on under
+  // another id, with no session.start: the ending one is saved and cleared
+  // here, and classic.SessionStart loads the next.
   on('session.end', async ($, e, next) => {
-    await saveTokens($, e.sessionId)
+    await queueSave($, e.sessionId)
 
-    if (e.reason === 'clear') {
+    if (e.reason === 'clear' || e.reason === 'resume') {
       await resetConversation($)
     }
 
     return next(e)
   })
 
+  on('classic.SessionStart', async ($, e, next) => {
+    await seedTokens($, e.session_id)
+    await update($, usageAtom, usage => usage ?? (lastUsage === null ? null : withoutConversation(lastUsage)))
+
+    return next(e)
+  })
+
   on('session.measure', async ($, e, next) => {
-    await update($, usageAtom, previous => withKnownLimits(previous, usageFromReading(e)))
+    await writeUsage($, e)
 
     return next(e)
   })
@@ -321,7 +353,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const startedAt = await $.clock.now()
     await update($, turnAtom, () => ({ turnId: e.turnId, startedAt, calls: [] }))
-    await requestRefresh($)
+    requestRefresh($)
 
     return next(e)
   })
@@ -344,9 +376,8 @@ export const register: Register = on => {
       await update($, lastTurnAtom, () => ({ reason: e.reason, endedAt, durationMs: e.durationMs }))
     }
 
-    await saveTokens($, await $.session.id())
-
-    await requestRefresh($)
+    void queueSave($, await $.session.id())
+    requestRefresh($)
 
     return next(e)
   })
@@ -364,7 +395,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (ran.deny === undefined && ran.isError !== true && ran.result.backgroundTaskId !== undefined) {
+    if (isAnswered(ran) && ran.result.backgroundTaskId !== undefined) {
       await addTask($, ran.result.backgroundTaskId, 'shell', e.description ?? e.command)
     }
 
@@ -374,7 +405,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (ran.deny === undefined && ran.isError !== true) {
+    if (isAnswered(ran)) {
       await addTask($, ran.result.taskId, 'monitor', e.description)
     }
 
@@ -384,7 +415,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Workflow' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (ran.deny === undefined && ran.isError !== true) {
+    if (isAnswered(ran)) {
       await addTask($, ran.result.taskId, 'workflow', ran.result.workflowName ?? e.name ?? 'workflow')
     }
 
@@ -394,11 +425,11 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (ran.deny === undefined && ran.isError !== true && 'taskId' in ran.result && ran.result.status === 'remote_launched') {
+    if (isAnswered(ran) && 'taskId' in ran.result && ran.result.status === 'remote_launched') {
       await addTask($, ran.result.taskId, 'remote', e.description)
     }
 
-    await requestRefresh($)
+    requestRefresh($)
 
     return ran
   })
@@ -406,12 +437,12 @@ export const register: Register = on => {
   on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (ran.deny === undefined && ran.isError !== true) {
+    if (isAnswered(ran)) {
       const stopped = ran.result.task_id
       await update($, tasksAtom, tasks => withoutTask(tasks, stopped))
     }
 
-    await requestRefresh($)
+    requestRefresh($)
 
     return ran
   })
@@ -420,13 +451,9 @@ export const register: Register = on => {
     const entered = await next(e)
 
     if (e.origin.kind === 'task-notification') {
-      const id = parseTaskNotificationId(e.text)
-
-      if (id !== null) {
-        await update($, tasksAtom, tasks => withoutTask(tasks, id))
-      }
-
-      await requestRefresh($)
+      const ended = endedTaskIds(e.text)
+      await update($, tasksAtom, tasks => withoutTasks(tasks, ended))
+      requestRefresh($)
     }
 
     return entered
@@ -440,19 +467,19 @@ export const register: Register = on => {
 
   on('classic.SubagentStop', async ($, e, next) => {
     await reconcileTasks($, e.background_tasks)
-    await requestRefresh($)
+    requestRefresh($)
 
     return next(e)
   })
 
-  on('classic.SubagentStart', async ($, e, next) => {
-    await requestRefresh($)
+  on('classic.SubagentStart', ($, e, next) => {
+    requestRefresh($)
 
     return next(e)
   })
 
-  on('classic.TeammateIdle', async ($, e, next) => {
-    await requestRefresh($)
+  on('classic.TeammateIdle', ($, e, next) => {
+    requestRefresh($)
 
     return next(e)
   })
@@ -470,14 +497,16 @@ export const register: Register = on => {
 
     const kit = $.ui.resolve(e)
     const { Button } = kit
-    const view = buildView(await snapshotOf($, e.props.isWorking))
+    // The engine knows whether a main turn runs; the turn record may have
+    // missed its end.
+    const view = buildView({ ...(await snapshotOf($)), isWorking: e.props.isWorking })
 
     const trailing = (
       <Button
-        key="dash"
+        key={COMMAND}
         plain
         dimColor
-        label="/dash"
+        label={`/${COMMAND}`}
         onPress={() => {
           void togglePane($)
         }}
@@ -488,7 +517,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const view = buildView(await snapshotOf($, null))
+    const view = buildView(await snapshotOf($))
 
     return paneTree($.ui.resolve(e), view, e.props.bodyColumns)
   })
