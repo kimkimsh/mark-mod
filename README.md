@@ -1,91 +1,121 @@
 # mark-mod
 
-Claude Code 프롬프트 바로 위에 세션 현황을 항상 띄워 주는 mod입니다. 지금 Claude가 무엇을 하고 있는지, 무엇을 기다리는지, 컨텍스트와 사용 한도가 얼마나 남았는지를 한눈에 봅니다.
+A Claude Code mod that keeps a live session dashboard above your prompt: what Claude is doing right now, what it is waiting on, and how much context and usage limit you have left.
+
+This README is for a Claude Code user who wants to install the mod and read what it shows. Developers changing the mod should also read [Development](#development) and [docs/design.md](docs/design.md).
 
 ```
-  ● 응답 중  Bash 실행 중                                                              토큰 1.09M $0.14 /dash
-  컨텍스트 ████████▉░ 89% 남음   5시간 ████▌░░░░░ 45% 남음 · 이 속도면 1h35m 후 소진   주간 ████████▎░ 82% 남음 · 6d5h 후 리셋
-  서브에이전트 1 · 백그라운드 1   Explore 6s   Run sleep 40 6s
+  ● Working  Bash running                                                    tokens 1.09M $0.14 /dash
+  Context ████████▉░ 89% left   5-hour ████▌░░░░░ 45% left · runs out in 1h35m at this pace   Weekly ████████▎░ 82% left · resets in 6d5h
+  subagents 1 · background 1   Explore 6s   Run sleep 40 6s
 ```
 
-## 설치
+## Install
 
-Claude Code 터미널 프롬프트에서:
+You need Claude Code **2.1.296 or newer** (the mod uses its function-hooks API). Check with:
+
+```
+claude --version
+```
+
+Then, at the Claude Code prompt in a terminal session, run:
 
 ```
 /plugin install mark-mod --marketplace kimkimsh/mark-mod
 ```
 
-마켓플레이스 추가를 물으면 `y`, 범위는 기본값(user)을 Enter로 고릅니다. 설치가 끝나면 그 세션에서 바로 동작하고, 이후 새 세션에서도 계속 뜹니다.
+1. Claude Code asks whether to add the marketplace `github:kimkimsh/mark-mod`. Answer `y`.
+2. Pick the install scope. The default, **user**, makes the mod load in every project; press Enter to accept it.
+3. You should see `Installed mark-mod. Plugin is now active.` The band appears above the prompt right away in that session, and in every session you start afterwards.
 
-필요한 것: Claude Code **2.1.296 이상**(function hooks mod API). `claude --version`으로 확인하세요.
+The same install from a shell, without opening a session:
 
-## 화면 읽는 법
+```
+claude plugin marketplace add kimkimsh/mark-mod
+claude plugin install mark-mod@mark-mod
+```
 
-### 1행: 지금 상태
+A session that was already running when you installed from the shell picks the mod up after `/reload-plugins`.
 
-| 표시 | 뜻 |
+## Use
+
+There is nothing to start: once installed, the band is drawn above the prompt in every session.
+
+- **Open the detail pane:** type `/dash` (or click `/dash` at the right end of the band). Run it again to close the pane. In fullscreen mode the pane docks beside the conversation; otherwise it opens above the prompt.
+- **Collapse the band:** click `[-]` at its right edge, or press `ctrl+x ctrl+a`.
+
+## What the band shows
+
+### Row 1: the current state
+
+| Shows | Meaning |
 |---|---|
-| `◆ 입력 필요` | Claude가 질문(AskUserQuestion)이나 계획 승인(ExitPlanMode)을 띄우고 내 답을 기다리는 중. 기다린 시간을 함께 표시 |
-| `● 응답 중` | 메인 턴이 돌고 있음. 실행 중인 도구 이름을 함께 표시 (경과 시간은 Claude Code 스피너에 이미 있음) |
-| `◌ 서브에이전트 대기` / `팀메이트 대기` / `백그라운드 대기` | 메인 턴은 끝났지만 그 일들이 아직 돌고 있음. 여러 개면 `서브에이전트, 백그라운드 대기`처럼 함께 표시 |
-| `✓ 전체 완료` | 돌고 있는 것이 하나도 없음. 마지막 턴이 언제 끝났고 얼마 걸렸는지 표시 |
-| `■ 중단됨` | 마지막 턴을 Esc 등으로 중단함 |
-| `✕ 오류로 종료` / `응답 거부됨` | 마지막 턴이 API 오류나 거부로 끝남 |
-| `○ 준비됨` | 이 세션에서 아직 아무 턴도 없음 |
+| `◆ Needs you` | Claude asked you a question (AskUserQuestion) or wants a plan approved (ExitPlanMode). Shows how long it has waited. |
+| `● Working` | A turn is running. Shows the tool in flight (`Bash running`, `Read +2 running`) or `thinking`. The elapsed time is already on Claude Code's own spinner. |
+| `◌ Waiting on subagents` / `teammates` / `background` | Claude's turn has ended, but those are still running. Several at once read `Waiting on subagents, background`. |
+| `✓ All done` | Nothing is running. Shows when the last turn ended and how long it took. |
+| `■ Interrupted` | The last turn was interrupted (for example with Esc). |
+| `✕ Ended with an error` / `Refused` | The last turn ended on an API error or a refusal. |
+| `○ Ready` | No turn has run in this session yet. |
 
-오른쪽 끝은 세션 누적 토큰과 비용, 그리고 상세 패널을 여는 `/dash`입니다. 폭이 좁아지면 `/dash` → 비용 → 토큰 순으로 빠집니다. 에이전트 목록을 읽지 못하면 `⚠ 갱신 실패`가 뜹니다.
+The right end shows the session's total tokens, its cost, and the `/dash` button. On a narrow terminal they drop out in this order: `/dash`, then cost, then tokens. If the list of agents cannot be read, `⚠ refresh failed` appears there.
 
-### 2행: 남은 양
+### Row 2: what is left
 
-막대는 **남은 양**입니다. 막대 옆 숫자도 남은 비율입니다. 여유가 있을 때는 회색이고, 40% 이하로 남으면 노랑, 15% 이하로 남으면 빨강과 `⚠`로 바뀝니다.
+Each bar is a fuel gauge: its length is the amount **left**, and the number beside it is the same amount.
 
-- **컨텍스트**: 현재 모델 컨텍스트 창 중 남은 비율
-- **5시간 / 주간**: 구독 사용 한도 중 남은 비율과 리셋까지 남은 시간
-- `이 속도면 1h35m 후 소진`: 지금까지 쓴 속도대로 가면 리셋 전에 한도가 바닥난다는 예고. 이때도 노랑으로 바뀝니다. 창이 막 시작됐을 때(5시간 한도는 처음 15분, 주간 한도는 처음 이틀)는 추정하지 않습니다
-- 폭이 좁아지면 막대 → 주간 리셋 안내 → 5시간 리셋 안내 순으로 빠지고, 숫자는 끝까지 남습니다
-- `측정 전`: 아직 첫 응답이 없어 값을 모름 (0%가 아님)
-- `리셋됨`: 리셋 시각이 지나 이전 값은 더 이상 맞지 않음. 다음 응답에서 갱신
-- API 키로 쓰는 등 한도 정보가 오지 않으면 한도 막대는 숨겨집니다
+- **Context**: how much of the model's context window is left.
+- **5-hour** and **Weekly**: how much of your subscription usage limits is left, and when each resets.
+- `runs out in 1h35m at this pace`: at the rate you have used this window so far, it will run out before it resets. This is a straight-line projection, and it is not made in the first 15 minutes of a 5-hour window or the first two days of a week.
 
-### 3행: 돌고 있는 일
+Colours: grey while there is plenty left; yellow at 40% left or less, or when a limit is on pace to run out; red with a `⚠` at 15% left or less.
 
-서브에이전트, 팀메이트(`팀메이트 1/3 작업` = 3명 중 1명 작업 중), 백그라운드 작업 수와 이름, 경과 시간. 돌고 있는 것이 없으면 이 행은 사라집니다.
+Other values you may see:
 
-## 상세 패널: `/dash`
+- `not measured yet`: no reply has arrived yet, so there is no reading. It never means 0%.
+- `reset` · `updates on next reply`: the window's reset time has passed, so the old reading no longer applies.
+- With an API key instead of a subscription, responses carry no limit data and the limit gauges are hidden.
 
-`/dash`를 입력하거나 밴드의 `/dash`를 클릭하면 패널이 열리고, 한 번 더 하면 닫힙니다. 전체 화면 모드에서는 대화 옆에 붙고, 아니면 프롬프트 위에 열립니다.
+On a narrow terminal the bars go first, then the weekly reset note, then the 5-hour one; the three numbers always stay.
 
-- 사용량: 컨텍스트(사용 토큰 / 창 크기), 5시간·주간 한도, 그 밖에 API가 알려 주는 한도
-- 토큰: 입력 · 출력 · 캐시 읽기 · 캐시 쓰기, 메인과 에이전트(서브에이전트·팀메이트) 몫
-- 서브에이전트 / 팀메이트 / 백그라운드: 돌고 있는 것을 하나씩, 경과 시간과 함께. 끝난 서브에이전트는 `완료 3 · 실패 1`처럼 한 줄로 묶음
+### Row 3: what is running
 
-밴드가 거슬리면 밴드 오른쪽 `[-]`(또는 `ctrl+x ctrl+a`)로 접을 수 있습니다.
+Running subagents, teammates (`teammates 1/3 working` means one of three is working) and background tasks, each with how long it has run. The row disappears when nothing is running.
 
-## 알아 둘 점
+## The `/dash` pane
 
-- **토큰**은 이 mod가 로드된 뒤의 API 요청만 셉니다(메인 + 에이전트). 입력·출력·캐시 읽기·캐시 쓰기를 모두 더한 값이라, 요청마다 다시 읽는 캐시 때문에 대화가 길수록 빠르게 커집니다. 내역은 `/dash`에 있습니다.
-- `claude --resume`이나 세션 안의 `/resume`으로 이어 열면 저장해 둔 값부터 이어 셉니다. `/clear`하면 새 세션이므로 0부터 다시 셉니다.
-- **경과 시간**은 mod가 그 작업을 처음 본 시점부터입니다.
-- **권한 확인 대화상자**는 상태로 표시하지 않습니다. 엔진이 대화상자가 열릴 때만 알려 주고 닫힐 때는 알려 주지 않아서, 승인 뒤 오래 도는 명령 동안 "입력 필요"가 잘못 남게 되기 때문입니다. 대화상자는 원래 밴드 자리에 뜹니다.
-- 별도 터미널 창(tmux 분할)으로 뜨는 팀메이트의 토큰은 이 세션에서 볼 수 없습니다.
+- **Usage**: context (tokens used / window size), the 5-hour and weekly limits, and any other limit the API reports.
+- **Tokens**: the total and cost, split into input, output, cache read and cache write, and into the main conversation versus agents (subagents and teammates).
+- **Subagents / Teammates / Background**: one row per running item with its age. Finished subagents fold into one line such as `done 3 · failed 1`.
 
-## 문제 해결
+## Good to know
 
-- 밴드가 안 보이면: `claude --version`이 2.1.296 이상인지, `/plugin`에서 mark-mod가 켜져 있는지 확인하세요. `claude --debug`로 실행하면 훅이 건너뛰어진 이유가 디버그 로그에 남습니다.
-- 업데이트: `claude plugin update mark-mod@mark-mod` 후 세션에서 `/reload-plugins`.
-- 제거: `/plugin uninstall mark-mod`.
+- **Tokens** add up every API request made after the mod loaded, for the main conversation and all agents: input, output, cache read and cache write. Cache reads are counted because they are tokens the session used; since every request re-reads the cached conversation, the total grows quickly as a conversation gets long. `/dash` shows the breakdown.
+- Reopening a session with `claude --resume`, or switching to another with `/resume`, continues that session's saved count. `/clear` starts a new session, so the count starts again from 0.
+- An agent's or task's age counts from when the mod first saw it.
+- **Permission prompts are not shown as a state.** Claude Code reports when a permission dialog opens but not when it closes, so after you approve a long command the band could not tell the dialog from the command running. The dialog itself appears where the band is.
+- Teammates running in their own terminal pane (a tmux split) are counted, but their tokens are not visible to this session.
 
-## 개발
+## Troubleshooting
 
-mod 자체는 `plugins/mark-mod/`에 있고, 저장소 루트에는 린트 도구만 있습니다.
+- **No band:** check `claude --version` (2.1.296 or newer) and that `mark-mod` is enabled under `/plugin`. Start Claude Code with `claude --debug` to see, in the debug log, why a hook was skipped.
+- **Update:** `claude plugin update mark-mod@mark-mod`, then `/reload-plugins` in any open session.
+- **Uninstall:** `/plugin uninstall mark-mod`.
+
+## Development
+
+The mod lives in `plugins/mark-mod/`; the repository root holds the marketplace file and the lint tooling.
 
 ```
-npm install
-npm run check        # oxlint + tsc + claude plugin validate + claude plugin test
-claude --plugin-dir plugins/mark-mod   # 이 폴더를 로드한 세션; 저장하면 바로 다시 로드됨
+npm install                                  # oxlint and the vendored anti-slop rules
+claude --plugin-dir plugins/mark-mod         # a session with this folder loaded; saving a file reloads it
+npm run check                                # oxlint, tsc, claude plugin validate, claude plugin test
 ```
 
-`tsc`가 쓰는 타입(`plugins/mark-mod/.claude-plugin/types/`)은 엔진이 mod를 한 번 로드할 때 깔아 줍니다. 처음 클론했다면 위 `claude --plugin-dir` 세션을 한 번 띄운 뒤 `npm run typecheck`를 실행하세요.
+`tsc` needs the type declarations that Claude Code writes into `plugins/mark-mod/.claude-plugin/types/` the first time it loads the mod from a folder. On a fresh clone, start the `claude --plugin-dir` session once before `npm run typecheck`.
 
-설계와 데이터 규칙: [docs/design.md](docs/design.md)
+Design and data rules: [docs/design.md](docs/design.md).
+
+## License
+
+[MIT](LICENSE)

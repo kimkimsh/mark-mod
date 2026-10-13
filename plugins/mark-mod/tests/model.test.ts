@@ -161,13 +161,13 @@ describe('headline', () => {
       }),
     )
 
-    expect(view.headline).toEqual({ phase: 'needs-input', title: '입력 필요', detail: '질문', elapsedText: '5s' })
+    expect(view.headline).toEqual({ phase: 'needs-input', title: 'Needs you', detail: 'question', elapsedText: '5s' })
   })
 
   test('plan approval reads as its own wait', () => {
     const view = buildView(snapshot({ asks: [{ id: 'p', tool: 'ExitPlanMode', startedAt: NOW }] }))
 
-    expect(view.headline.detail).toBe('계획 승인')
+    expect(view.headline.detail).toBe('plan approval')
   })
 
   test('a running turn names the tools in flight', () => {
@@ -178,12 +178,12 @@ describe('headline', () => {
 
     expect(buildView(snapshot({ isWorking: true, turn: RUNNING_TURN })).headline).toEqual({
       phase: 'working',
-      title: '응답 중',
-      detail: '생각 중',
+      title: 'Working',
+      detail: 'thinking',
       elapsedText: '',
     })
     expect(buildView(snapshot({ isWorking: true, turn: { ...RUNNING_TURN, calls } })).headline.detail).toBe(
-      'Bash 외 1개 실행 중',
+      'Bash +1 running',
     )
   })
 
@@ -203,9 +203,9 @@ describe('headline', () => {
 
     const tasks: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: NOW }]
 
-    expect(buildView(snapshot({ live })).headline.title).toBe('서브에이전트 대기')
-    expect(buildView(snapshot({ live, tasks })).headline.title).toBe('서브에이전트, 백그라운드 대기')
-    expect(buildView(snapshot({ tasks })).headline.title).toBe('백그라운드 대기')
+    expect(buildView(snapshot({ live })).headline.title).toBe('Waiting on subagents')
+    expect(buildView(snapshot({ live, tasks })).headline.title).toBe('Waiting on subagents, background')
+    expect(buildView(snapshot({ tasks })).headline.title).toBe('Waiting on background')
   })
 
   test('an idle teammate is not something to wait on', () => {
@@ -225,11 +225,11 @@ describe('headline', () => {
     const ended = (reason: 'answer' | 'aborted' | 'refusal' | 'error') =>
       buildView(snapshot({ lastTurn: { reason, endedAt: NOW - 120_000, durationMs: 192_000 } })).headline
 
-    expect(ended('answer')).toEqual({ phase: 'done', title: '전체 완료', detail: '2m 전 · 3m12s 소요', elapsedText: '' })
-    expect(ended('aborted').title).toBe('중단됨')
+    expect(ended('answer')).toEqual({ phase: 'done', title: 'All done', detail: '2m ago · took 3m12s', elapsedText: '' })
+    expect(ended('aborted').title).toBe('Interrupted')
     expect(ended('error').phase).toBe('error')
-    expect(ended('refusal').title).toBe('응답 거부됨')
-    expect(buildView(snapshot({})).headline.title).toBe('준비됨')
+    expect(ended('refusal').title).toBe('Refused')
+    expect(buildView(snapshot({})).headline.title).toBe('Ready')
   })
 })
 
@@ -244,9 +244,9 @@ describe('meters', () => {
   test('limits say what is left and when it resets', () => {
     const [context, fiveHour, weekly] = buildView(snapshot({ usage, hasResponse: true })).meters
 
-    expect(context).toMatchObject({ leftPercent: 54, valueText: '54% 남음', noteText: '92k / 200k', severity: 'ok' })
-    expect(fiveHour).toMatchObject({ label: '5시간', leftPercent: 76.5, valueText: '76% 남음', noteText: '2h14m 후 리셋' })
-    expect(weekly).toMatchObject({ label: '주간', valueText: '리셋됨', leftPercent: null })
+    expect(context).toMatchObject({ leftPercent: 54, valueText: '54% left', noteText: '92k / 200k', severity: 'ok' })
+    expect(fiveHour).toMatchObject({ label: '5-hour', leftPercent: 76.5, valueText: '76% left', noteText: 'resets in 2h14m' })
+    expect(weekly).toMatchObject({ label: 'Weekly', valueText: 'reset', leftPercent: null })
   })
 
   test('nearly spent limits turn to warning and danger', () => {
@@ -260,16 +260,16 @@ describe('meters', () => {
   test('no reading before the first response, no data after it', () => {
     const empty = { ...usage, limits: [] }
 
-    expect(buildView(snapshot({ usage: empty })).meters[1]).toMatchObject({ valueText: '측정 전', isAvailable: true })
+    expect(buildView(snapshot({ usage: empty })).meters[1]).toMatchObject({ valueText: 'not measured yet', isAvailable: true })
 
     const after = buildView(snapshot({ usage: empty, hasResponse: true }))
 
-    expect(after.meters[1]).toMatchObject({ valueText: '정보 없음', isAvailable: false })
+    expect(after.meters[1]).toMatchObject({ valueText: 'no data', isAvailable: false })
     expect(after.limitsNote).not.toBeNull()
   })
 
   test('context reads as room left, unmeasured context as not yet measured', () => {
-    expect(buildView(snapshot({})).meters[0]).toMatchObject({ valueText: '측정 전', leftPercent: null })
+    expect(buildView(snapshot({})).meters[0]).toMatchObject({ valueText: 'not measured yet', leftPercent: null })
   })
 
   test('a reading without windows keeps the last known ones', () => {
@@ -283,11 +283,11 @@ describe('meters', () => {
   test('a recent end reads as just now, never as invented seconds', () => {
     const view = buildView(snapshot({ lastTurn: { reason: 'answer', endedAt: NOW - 14_000, durationMs: 3_000 } }))
 
-    expect(view.headline.detail).toBe('방금 · 3s 소요')
+    expect(view.headline.detail).toBe('just now · took 3s')
 
     const later = buildView(snapshot({ lastTurn: { reason: 'answer', endedAt: NOW - 276_000, durationMs: 3_000 } }))
 
-    expect(later.headline.detail).toBe('4m 전 · 3s 소요')
+    expect(later.headline.detail).toBe('4m ago · took 3s')
   })
 
   test('a window spent faster than it resets warns before the percentage would', () => {
@@ -301,7 +301,7 @@ describe('meters', () => {
 
     const [, meter] = buildView(snapshot({ usage: { ...usage, limits: [fiveHour] }, hasResponse: true })).meters
 
-    expect(meter).toMatchObject({ severity: 'warn', noteText: '이 속도면 1h53m 후 소진' })
+    expect(meter).toMatchObject({ severity: 'warn', noteText: 'runs out in 1h53m at this pace' })
   })
 
   test('display width counts Hangul as two cells', () => {
