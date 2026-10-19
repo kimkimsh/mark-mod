@@ -72,7 +72,7 @@ Colours: grey while there is plenty left; yellow at 40% left or less, or when a 
 
 Other values you may see:
 
-- `not measured yet`: no reply has arrived yet, so there is no reading. It never means 0%.
+- `not measured yet`: no reply has arrived yet, so there is no reading. It never means 0%. Context also reads this right after a compaction (`/compact` or an automatic one), until the next reply measures the smaller conversation.
 - `reset` · `updates on next reply`: the window's reset time has passed, so the old reading no longer applies.
 - With an API key instead of a subscription, responses carry no limit data and the limit gauges are hidden.
 

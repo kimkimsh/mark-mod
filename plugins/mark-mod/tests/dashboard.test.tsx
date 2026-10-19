@@ -102,14 +102,24 @@ async function bandText($: Engine, isWorking: boolean, columns: number): Promise
   return text
 }
 
-async function measure($: Engine, world: World): Promise<void> {
+const MEASURED: SessionUsage = {
+  startedAt: START,
+  context: { tokens: 92_100, window: 200_000, percent: 46 },
+  rateLimits: [
+    { kind: 'five_hour', percentUsed: 33, resetsAt: new Date(START + 2 * 3_600_000).toISOString() },
+    { kind: 'seven_day', percentUsed: 13, resetsAt: new Date(START + 6 * 86_400_000).toISOString() },
+  ],
+  cost: { usd: 3.41 },
+}
+
+// The engine's session.measure carries what $.session.usage() answers at
+// that moment, so the world answers the same figures from then on.
+async function measure($: Engine, world: World, usage: SessionUsage): Promise<void> {
+  world.usage = usage
   await $.session.measure({
-    context: { tokens: 92_100, window: 200_000, percent: 46 },
-    rateLimits: [
-      { kind: 'five_hour', percentUsed: 33, resetsAt: new Date(START + 2 * 3_600_000).toISOString() },
-      { kind: 'seven_day', percentUsed: 13, resetsAt: new Date(START + 6 * 86_400_000).toISOString() },
-    ],
-    cost: { usd: 3.41 },
+    context: usage.context,
+    rateLimits: usage.rateLimits,
+    cost: usage.cost ?? { usd: 0 },
     changed: ['context', 'rateLimits', 'cost'],
   })
   await world.clock.settle()
@@ -148,7 +158,7 @@ describe('band', () => {
   test('a measurement fills context, both limits and cost', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
     const text = await bandText($, false, 140)
 
     expect(text).toContain('54% left')
@@ -162,7 +172,7 @@ describe('band', () => {
     const world = boot(on, SESSION_ID)
     on('classic.SessionStart', () => ({}))
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
     await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
     await $.classic.SessionStart({ source: 'clear', session_id: 'session-2' })
     const text = await bandText($, false, 140)
@@ -175,10 +185,28 @@ describe('band', () => {
   test('a window whose reset time passed stops claiming its old reading', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
     await world.clock.advance(2 * 3_600_000 + 1_000)
 
     expect(await bandText($, false, 140)).toContain('updates on next reply')
+  })
+
+  test('a compaction takes the old context reading down at once, and the next reading puts it back', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await measure($, world, MEASURED)
+
+    world.usage = { ...MEASURED, context: { window: 200_000 } }
+    await world.clock.advance(1_000)
+    const compacted = await bandText($, false, 140)
+
+    expect(compacted).toContain('Context not measured yet')
+    expect(compacted).toContain('67% left')
+
+    world.usage = { ...MEASURED, context: { tokens: 20_000, window: 200_000, percent: 10 } }
+    await world.clock.advance(1_000)
+
+    expect(await bandText($, false, 140)).toContain('90% left')
   })
 
   test('a running turn shows the tool in flight, and a plan awaiting approval outranks it', async ($, on) => {
@@ -333,7 +361,7 @@ describe('band', () => {
   test('narrow bands drop the bars, short bands drop rows', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
 
     expect(await bandText($, false, 140)).toContain('█')
     expect(await bandText($, false, 60)).not.toContain('█')
@@ -369,7 +397,7 @@ describe('band layout', () => {
   test('values come first; the weekly reset note and the bars give way to width', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
 
     const wide = await bandText($, false, 140)
 
@@ -403,12 +431,12 @@ describe('band layout', () => {
   })
 
   test('a limit on pace to run out before its reset warns ahead of time', async ($, on) => {
-    boot(on, SESSION_ID)
+    const world = boot(on, SESSION_ID)
     await start($)
-    await $.session.measure({
+    await measure($, world, {
+      startedAt: START,
       context: { tokens: 10_000, window: 200_000, percent: 5 },
       rateLimits: [{ kind: 'five_hour', percentUsed: 47, resetsAt: new Date(START + 199 * 60_000).toISOString() }],
-      changed: ['rateLimits'],
     })
 
     expect(await bandText($, false, 140)).toContain('runs out in 1h53m at this pace')
@@ -522,7 +550,7 @@ describe('pane', () => {
     const world = boot(on, SESSION_ID)
     on('classic.Stop', () => ({}))
     await start($)
-    await measure($, world)
+    await measure($, world, MEASURED)
     world.agents = [
       { id: 'a1', description: 'list files', type: 'Explore', status: 'running' },
       { id: 'a2', description: 'review', type: 'general-purpose', status: 'completed', parentId: 'a1' },
