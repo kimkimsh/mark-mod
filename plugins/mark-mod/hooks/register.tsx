@@ -66,8 +66,13 @@ type SavedSession = { tokens: DashTokens; savedAt: number }
 let lastUsage: DashUsage | null = null
 
 async function writeUsage($: EngineInterface, reading: UsageReading): Promise<void> {
-  const usage = await update($, usageAtom, previous => withKnownLimits(previous ?? lastUsage, usageFromReading(reading)))
+  const previous = await read($, usageAtom)
+  const usage = withKnownLimits(previous ?? lastUsage, usageFromReading(reading))
   lastUsage = usage
+
+  if (JSON.stringify(usage) !== JSON.stringify(previous)) {
+    await update($, usageAtom, () => usage)
+  }
 }
 
 const COUNT_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite']
@@ -164,7 +169,8 @@ function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
 }
 
-// The only writer of `live`; requestRefresh keeps it to one run at a time.
+// The only writer of `live`, and of `usage` from the engine's reading;
+// requestRefresh keeps it to one run at a time.
 async function refreshLive($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   let listed: Awaited<ReturnType<EngineInterface['agent']['list']>> | null = null
@@ -185,6 +191,12 @@ async function refreshLive($: EngineInterface): Promise<void> {
   if (JSON.stringify(next) !== JSON.stringify(previous)) {
     await update($, liveAtom, () => next)
   }
+
+  // A compaction, manual or automatic, empties the context reading, and no
+  // event this plugin is sure to receive says so: session.measure follows a
+  // main-thread turn or a limit's move, and session.compact passes over a
+  // plugin the person installed where an organization manages Claude Code.
+  await writeUsage($, await $.session.usage())
 }
 
 let refreshInFlight: Promise<void> | null = null
@@ -319,7 +331,6 @@ export const register: Register = on => {
       requestRefresh($)
     })
     await seedTokens($, await $.session.id())
-    await writeUsage($, await $.session.usage())
 
     return next(e)
   })
@@ -344,8 +355,8 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.measure', async ($, e, next) => {
-    await writeUsage($, e)
+  on('session.measure', ($, e, next) => {
+    requestRefresh($)
 
     return next(e)
   })

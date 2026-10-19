@@ -10,7 +10,7 @@ Shown at all times, above the prompt:
 | Item | Source (engine API, Claude Code 2.1.296) |
 |---|---|
 | Current state | `turn.start` / `turn.complete` (main loop), in-flight `tool.call`s, AbovePrompt `props.isWorking` |
-| Context window fill | `session.measure` push, seeded by `$.session.usage()` |
+| Context window fill | `$.session.usage()`, read on the 1 s tick and on each `session.measure` |
 | 5-hour limit left | `rateLimits[kind=five_hour]` from the same |
 | Weekly limit left | `rateLimits[kind=seven_day]` from the same |
 | Session tokens | sum of `turn.step` result `usage` (main loop + every subagent loop) |
@@ -52,6 +52,10 @@ band would be.
   them on time.
 - **A reset window is not still full.** When `resetsAt` has passed, the last
   reading is stale: the meter reads "reset" until the next response refreshes it.
+- **A compacted context is not still full.** A compaction (`/compact` or
+  automatic) empties the engine's context reading until the next response; the
+  tick picks that up within a second, so Context reads "not measured yet"
+  instead of the fill from before the compaction.
 - **`background_tasks` absent ≠ empty.** An older build leaves the field out;
   reconciliation then does nothing rather than clearing the list.
 - **Agent list pull fails** → the previous list stays; the band shows
@@ -70,12 +74,19 @@ band would be.
 
 ## Liveness
 
-A 1 s `$.clock.every` tick pulls `$.agent.list()` and the clock. It writes only
-when something changed; while nothing runs the clock is stored at 30 s
-resolution, so an idle session costs one write per 30 s, and "ago" text is
-drawn in whole minutes ("just now", "4m ago") so it never shows invented seconds.
+A 1 s `$.clock.every` tick pulls `$.agent.list()`, `$.session.usage()` and the
+clock. It writes only when something changed; while nothing runs the clock is
+stored at 30 s resolution, so an idle session costs one write per 30 s, and
+"ago" text is drawn in whole minutes ("just now", "4m ago") so it never shows
+invented seconds.
 
-Usage needs no polling: `session.measure` fires after every response.
+Usage is pulled, not only pushed. `session.measure` fires after a main-thread
+turn or when a limit moves, so on its own it leaves the context fill unchanged
+for the length of a long turn, and nothing at all follows a compaction:
+`session.compact` and the classic compact hooks pass over a plugin the person
+installed where an organization manages Claude Code (the engine's
+`cc-plugin-sec-default` takes them on a team account). `session.measure`
+still asks for a refresh, so a turn's end shows at once.
 
 Tokens come from the streaming `turn.step` result rather than `turn.complete`,
 so a long main turn updates the total per request instead of once at its end.
