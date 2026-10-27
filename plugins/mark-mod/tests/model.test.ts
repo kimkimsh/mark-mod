@@ -8,15 +8,25 @@ import {
   buildView,
   cellWidth,
   clipCells,
+  effortLabel,
   exhaustsBeforeReset,
   emptyTokens,
   formatCost,
   formatDuration,
   formatTokens,
   endedTaskIds,
-  tasksFromReading,
+  livePaneIds,
+  modelFamily,
+  paneListingArgv,
+  paneRosterFromText,
+  rosterPath,
+  tasksStillRead,
   usageFromReading,
+  withAnsweredModel,
   withKnownLimits,
+  withRequest,
+  withSpawnModel,
+  withoutAgentModels,
 } from '../hooks/model'
 import type { DashSnapshot } from '../hooks/model'
 
@@ -35,6 +45,7 @@ function snapshot(overrides: Partial<DashSnapshot>): DashSnapshot {
     lastTurn: null,
     usage: null,
     live: IDLE_LIVE,
+    agentModels: {},
     ...overrides,
   }
 }
@@ -118,27 +129,20 @@ describe('readings', () => {
     expect(again[0]?.status).toBe('completed')
   })
 
-  test('agent loops in background_tasks are left to the agent list', () => {
-    const previous: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5 }]
+  test('the snapshot takes down a task it no longer lists, and adds none', () => {
+    const previous: DashTask[] = [
+      { id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5, endsBy: null },
+      { id: 'mo', kind: 'monitor', description: 'watch CI', startedAt: 7, endsBy: 60_007 },
+    ]
 
-    const tasks = tasksFromReading(
-      [
-        { id: 'sh', type: 'shell', description: 'Run tests', command: 'npm test' },
-        { id: 'ag', type: 'subagent', description: 'list files' },
-        { id: 'tm', type: 'in_process_teammate', description: 'scout' },
-        { id: 'mo', type: 'monitor', description: 'watch CI' },
-        { id: 'sh2', type: 'shell', description: '', command: 'sleep 9' },
-      ],
-      previous,
-      new Set(['tm']),
-      50,
-    )
-
-    expect(tasks).toEqual([
-      { id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5 },
-      { id: 'mo', kind: 'monitor', description: 'watch CI', startedAt: 50 },
-      { id: 'sh2', kind: 'shell', description: 'sleep 9', startedAt: 50 },
+    const tasks = tasksStillRead(previous, [
+      { id: 'sh', type: 'shell', description: 'Run tests', command: 'npm test' },
+      { id: 'ag', type: 'subagent', description: 'list files' },
+      { id: 'tnonmf77g', type: 'teammate', description: 'teammate probe' },
+      { id: 'b0ojyy9gl', type: 'shell', description: 'sleep 25', command: 'sleep 25' },
     ])
+
+    expect(tasks).toEqual([{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: 5, endsBy: null }])
   })
 
   test('tokens split between the main loop and the agents', () => {
@@ -148,6 +152,114 @@ describe('readings', () => {
     expect(tokens.main).toEqual({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 })
     expect(tokens.agents).toEqual({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 })
     expect(buildView(snapshot({ tokens })).tokens.totalText).toBe('20')
+  })
+})
+
+describe('pane teammates', () => {
+  test('a roster names the members on a tmux pane, and a file of another shape names none', () => {
+    const roster = paneRosterFromText(
+      JSON.stringify({
+        leadProcess: { pid: 71463 },
+        members: [
+          { agentId: 'team-lead@s', tmuxPaneId: 'leader', backendType: 'in-process' },
+          { agentId: 'sleeper@s', tmuxPaneId: '%0', backendType: 'tmux' },
+          { agentId: 'odd@s', tmuxPaneId: 7, backendType: 'tmux' },
+        ],
+      }),
+    )
+
+    expect(roster.leadPid).toBe(71463)
+    expect([...roster.panes]).toEqual([['sleeper@s', '%0']])
+    expect(paneRosterFromText('{"members": [').panes.size).toBe(0)
+    expect(paneRosterFromText('[]').leadPid).toBeNull()
+  })
+
+  test('the pane listing goes to the server the engine put its panes on', () => {
+    expect(paneListingArgv('/tmp/tmux-1000/default,4242,0', 71463)?.slice(0, 3)).toEqual(['tmux', '-S', '/tmp/tmux-1000/default'])
+    expect(paneListingArgv(undefined, 71463)?.slice(0, 3)).toEqual(['tmux', '-L', 'claude-swarm-71463'])
+    expect(paneListingArgv('', null)).toBeNull()
+    expect(rosterPath('/home/u/.claude', 'sleeper@session-1')).toBe('/home/u/.claude/teams/session-1/config.json')
+  })
+
+  test('a dead pane is not a live one', () => {
+    expect([...livePaneIds('%0 0\n%5 1\n\n')]).toEqual(['%0'])
+  })
+})
+
+describe('agent models', () => {
+  test('a worker row names the model family, whatever the id around it', () => {
+    expect(modelFamily('claude-haiku-5-5')).toBe('haiku')
+    expect(modelFamily('claude-opus-5-5[1m]')).toBe('opus')
+    expect(modelFamily('claude-3-5-sonnet-20241022')).toBe('sonnet')
+    expect(modelFamily('us.anthropic.claude-sonnet-5-5-v1:0')).toBe('sonnet')
+    expect(modelFamily('haiku')).toBe('haiku')
+    expect(modelFamily('gpt-x')).toBe('gpt-x')
+  })
+
+  test('effort is a level or an integer budget', () => {
+    expect(effortLabel('low')).toBe('low')
+    expect(effortLabel(16_000)).toBe('16k')
+    expect(effortLabel(undefined)).toBeNull()
+  })
+
+  test('the answered model replaces the one a request named, and keeps its effort', () => {
+    const requested = withRequest({}, 'a', 'claude-haiku-5-5', 'low')
+    const answered = withAnsweredModel(requested, 'a', 'claude-sonnet-5-5')
+
+    expect(answered).toEqual({ a: { model: 'claude-sonnet-5-5', effort: 'low' } })
+    expect(withAnsweredModel(answered, 'a', 'claude-sonnet-5-5')).toBe(answered)
+  })
+
+  test('a spawn or a request names a model only while none is known', () => {
+    const answered = { a: { model: 'claude-sonnet-5-5', effort: 'low' } }
+
+    expect(withSpawnModel(answered, 'a', 'claude-haiku-5-5')).toBe(answered)
+    expect(withRequest(answered, 'a', 'claude-haiku-5-5', 'low')).toBe(answered)
+    expect(withSpawnModel({}, 'a', 'claude-haiku-5-5')).toEqual({ a: { model: 'claude-haiku-5-5', effort: null } })
+  })
+
+  test('a spawn result after the first request keeps its effort', () => {
+    const requested = withRequest({}, 'a', 'claude-haiku-5-5', 'medium')
+
+    expect(withSpawnModel(requested, 'a', 'claude-haiku-5-5')).toBe(requested)
+  })
+
+  test('a request with no effort clears the effort an earlier one asked for', () => {
+    const requested = withRequest({}, 'a', 'claude-haiku-5-5', 'high')
+
+    expect(withRequest(requested, 'a', 'claude-haiku-5-5', null)).toEqual({ a: { model: 'claude-haiku-5-5', effort: null } })
+  })
+
+  test('an agent that left the list leaves the map', () => {
+    const models = { a: { model: 'm', effort: null }, b: { model: 'm', effort: null } }
+
+    expect(withoutAgentModels(models, ['a'])).toEqual({ b: { model: 'm', effort: null } })
+    expect(withoutAgentModels(models, ['c'])).toBe(models)
+  })
+
+  test('a worker row carries its agent\'s model and effort', () => {
+    const live: DashLive = {
+      now: NOW,
+      agents: [
+        { id: 'a', label: 'Explore', description: 'x', status: 'running', isTeammate: false, isNested: false, firstSeenAt: NOW },
+        { id: 'b', label: 'scout', description: 'y', status: 'running', isTeammate: true, isNested: false, firstSeenAt: NOW },
+        { id: 'c', label: 'Plan', description: 'z', status: 'running', isTeammate: false, isNested: false, firstSeenAt: NOW },
+      ],
+      listError: null,
+    }
+
+    const view = buildView(
+      snapshot({
+        live,
+        agentModels: {
+          a: { model: 'claude-haiku-5-5', effort: 'low' },
+          b: { model: 'claude-opus-5-5', effort: null },
+        },
+      }),
+    )
+
+    expect(view.subagents.map(worker => worker.modelText)).toEqual(['haiku·low', ''])
+    expect(view.teammates[0]?.modelText).toBe('opus')
   })
 })
 
@@ -201,7 +313,7 @@ describe('headline', () => {
       listError: null,
     }
 
-    const tasks: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: NOW }]
+    const tasks: DashTask[] = [{ id: 'sh', kind: 'shell', description: 'npm test', startedAt: NOW, endsBy: null }]
 
     expect(buildView(snapshot({ live })).headline.title).toBe('Waiting on subagents')
     expect(buildView(snapshot({ live, tasks })).headline.title).toBe('Waiting on subagents, background')

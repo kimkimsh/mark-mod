@@ -2,7 +2,9 @@ export type DashCall = { id: string; tool: string; startedAt: number }
 
 export type DashTurn = { turnId: string; startedAt: number; calls: DashCall[] }
 
-export type DashTask = { id: string; kind: string; description: string; startedAt: number }
+// endsBy: the latest the task can still be running (a monitor's deadline);
+// null when only its notification or a Stop snapshot can end it.
+export type DashTask = { id: string; kind: string; description: string; startedAt: number; endsBy: number | null }
 
 export type DashCounts = {
   input: number
@@ -48,6 +50,14 @@ export type DashAgent = {
 
 export type DashLive = { now: number; agents: DashAgent[]; listError: string | null }
 
+// What an agent runs on, by agent id: the model that answered its latest
+// response or, before one, the first its spawn or a request named; and the
+// effort its latest request asked for. A teammate in a pane of its own makes
+// no request here, so it shows its model alone.
+export type DashAgentModel = { model: string; effort: string | null }
+
+export type DashAgentModels = Record<string, DashAgentModel>
+
 declare module 'claude-code' {
   interface PluginState {
     'mark-mod': {
@@ -59,6 +69,7 @@ declare module 'claude-code' {
       lastTurn: DashTurnEnd | null
       usage: DashUsage | null
       live: DashLive
+      agentModels: DashAgentModels
     }
   }
 }

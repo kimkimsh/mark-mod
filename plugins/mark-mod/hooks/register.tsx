@@ -1,25 +1,36 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
 
-import type { DashAgent, DashCall, DashCounts, DashTask, DashTokens, DashUsage } from '../types'
+import type { DashAgent, DashAgentModels, DashCall, DashCounts, DashTask, DashTokens, DashUsage } from '../types'
 import {
   addTokens,
   agentsFromReading,
   buildView,
+  effortLabel,
   emptyTokens,
   endedTaskIds,
   isAgentActive,
   isAskingTool,
+  isTaskOver,
   isTokensEmpty,
-  tasksFromReading,
+  livePaneIds,
+  paneListingArgv,
+  paneRosterFromText,
+  rosterPath,
+  tasksStillRead,
   usageFromReading,
+  withAnsweredModel,
   withKnownLimits,
+  withRequest,
+  withSpawnModel,
+  withEndedPanes,
   withTask,
+  withoutAgentModels,
   withoutConversation,
   withoutTask,
   withoutTasks,
 } from './model'
-import type { DashSnapshot, TaskReading, UsageCounts, UsageReading } from './model'
+import type { AgentReading, DashSnapshot, PaneRoster, TaskReading, UsageCounts, UsageReading } from './model'
 import { bandTree, paneTree } from './view'
 
 const PANE_ID = 'mark-mod'
@@ -40,6 +51,14 @@ const STORE_PREFIX = 'tokens:'
 
 const STORE_SESSIONS_KEPT = 30
 
+// A Monitor result's timeoutMs when the monitor runs until stopped.
+const PERSISTENT_MONITOR_TIMEOUT_MS = 0
+
+// The tick waits on this, so a tmux that hangs cannot stall the band.
+const TMUX_TIMEOUT_MS = 2_000
+
+const DEFAULT_CONFIG_DIR = '.claude'
+
 // Every $.state reference spells its plugin and key as literals: the
 // validator reads them from source and refuses a computed one.
 const turnAtom = atom({ plugin: 'mark-mod', key: 'turn' } as const, null)
@@ -57,6 +76,8 @@ const lastTurnAtom = atom({ plugin: 'mark-mod', key: 'lastTurn' } as const, null
 const usageAtom = atom({ plugin: 'mark-mod', key: 'usage' } as const, null)
 
 const liveAtom = atom({ plugin: 'mark-mod', key: 'live' } as const, { now: 0, agents: [], listError: null })
+
+const agentModelsAtom = atom({ plugin: 'mark-mod', key: 'agentModels' } as const, {})
 
 type SavedSession = { tokens: DashTokens; savedAt: number }
 
@@ -169,10 +190,108 @@ function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
 }
 
-// The only writer of `live`, and of `usage` from the engine's reading;
-// requestRefresh keeps it to one run at a time.
+// Where the engine keeps its teams: CLAUDE_CONFIG_DIR, or ~/.claude.
+async function configDir($: EngineInterface): Promise<string | null> {
+  const configured = await $.env.get('CLAUDE_CONFIG_DIR')
+
+  if (configured !== undefined && configured !== '') {
+    return configured
+  }
+
+  const home = await $.env.get('HOME')
+
+  return home === undefined ? null : `${home}/${DEFAULT_CONFIG_DIR}`
+}
+
+// A roster that cannot be read, as after the team is deleted, names no pane.
+async function readRoster($: EngineInterface, path: string): Promise<PaneRoster> {
+  try {
+    return paneRosterFromText(await $.fs.read(path))
+  } catch {
+    return { leadPid: null, panes: new Map() }
+  }
+}
+
+// null when tmux cannot be run, which says nothing about the panes. A server
+// that is not running exits non-zero and has none: the engine's own exits
+// with its last pane and leaves its socket file behind.
+async function listPanes($: EngineInterface, argv: readonly string[]): Promise<string | null> {
+  try {
+    const ran = await $.process.run(argv, { timeoutMs: TMUX_TIMEOUT_MS })
+
+    return ran.exitCode === 0 ? ran.stdout : ''
+  } catch {
+    return null
+  }
+}
+
+// The working pane teammates whose pane is gone or dead, by teammateId; one
+// roster read and one tmux call per team, and none while no pane teammate
+// works.
+async function endedPaneTeammates($: EngineInterface, agents: readonly AgentReading[]): Promise<Set<string>> {
+  const ended = new Set<string>()
+  const working = agents.flatMap(agent => (agent.teammateId !== undefined && isAgentActive(agent.status) ? [agent.teammateId] : []))
+
+  if (working.length === 0) {
+    return ended
+  }
+
+  const dir = await configDir($)
+
+  if (dir === null) {
+    return ended
+  }
+
+  const tmuxEnv = await $.env.get('TMUX')
+  const rosters = new Map<string, string[]>()
+
+  for (const teammateId of working) {
+    const path = rosterPath(dir, teammateId)
+    rosters.set(path, [...(rosters.get(path) ?? []), teammateId])
+  }
+
+  for (const [path, teammateIds] of rosters) {
+    const roster = await readRoster($, path)
+    const argv = paneListingArgv(tmuxEnv, roster.leadPid)
+
+    const panes = teammateIds.flatMap(teammateId => {
+      const paneId = roster.panes.get(teammateId)
+
+      return paneId === undefined ? [] : [{ teammateId, paneId }]
+    })
+
+    if (argv === null || panes.length === 0) {
+      continue
+    }
+
+    const listing = await listPanes($, argv)
+
+    if (listing === null) {
+      continue
+    }
+
+    const live = livePaneIds(listing)
+
+    for (const pane of panes) {
+      if (!live.has(pane.paneId)) {
+        ended.add(pane.teammateId)
+      }
+    }
+  }
+
+  return ended
+}
+
+// The only writer of `live`, of `usage` from the engine's reading, of a
+// task's end by its deadline, and of an agent's leaving `agentModels` with
+// the list; requestRefresh keeps it to one run at a time.
 async function refreshLive($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
+
+  if ((await read($, tasksAtom)).some(task => isTaskOver(task, now))) {
+    await update($, tasksAtom, tasks => tasks.filter(task => !isTaskOver(task, now)))
+  }
+
   let listed: Awaited<ReturnType<EngineInterface['agent']['list']>> | null = null
   let listError: string | null = null
 
@@ -183,8 +302,18 @@ async function refreshLive($: EngineInterface): Promise<void> {
     listError = errorText(cause)
   }
 
+  const readings = listed === null ? null : withEndedPanes(listed, await endedPaneTeammates($, listed))
   const previous = await read($, liveAtom)
-  const agents = listed === null ? previous.agents : agentsFromReading(listed, previous.agents, now)
+  const agents = readings === null ? previous.agents : agentsFromReading(readings, previous.agents, now)
+
+  // Only an agent the list named and no longer does: a teammate's model is
+  // recorded at its spawn, which may come before the list names it.
+  if (listed !== null) {
+    const listedIds = new Set(listed.map(agent => agent.id))
+    const gone = previous.agents.filter(agent => !listedIds.has(agent.id)).map(agent => agent.id)
+    await changeAgentModels($, models => withoutAgentModels(models, gone))
+  }
+
   const clock = (await isAnythingRunning($, agents)) ? now : now - (now % IDLE_CLOCK_STEP_MS)
   const next = { now: clock, agents, listError }
 
@@ -257,8 +386,15 @@ function isAnswered<R extends { deny?: string; isError?: true }>(
   return ran.deny === undefined && ran.isError !== true
 }
 
-async function addTask($: EngineInterface, id: string, kind: string, description: string): Promise<void> {
-  const task: DashTask = { id, kind, description, startedAt: await $.clock.now() }
+async function addTask(
+  $: EngineInterface,
+  id: string,
+  kind: string,
+  description: string,
+  runsForMs: number | null,
+): Promise<void> {
+  const startedAt = await $.clock.now()
+  const task: DashTask = { id, kind, description, startedAt, endsBy: runsForMs === null ? null : startedAt + runsForMs }
   await update($, tasksAtom, tasks => withTask(tasks, task))
 }
 
@@ -270,21 +406,28 @@ async function addStepUsage($: EngineInterface, usage: UsageCounts, isMainLoop: 
   }
 }
 
+// turn.step runs once per request, so the map is written only when it changes.
+async function changeAgentModels($: EngineInterface, change: (models: DashAgentModels) => DashAgentModels): Promise<void> {
+  const models = await read($, agentModelsAtom)
+
+  if (change(models) !== models) {
+    await update($, agentModelsAtom, change)
+  }
+}
+
 async function reconcileTasks($: EngineInterface, readings: readonly TaskReading[] | undefined): Promise<void> {
   // An absent list means this build reports none, not that nothing runs.
   if (readings === undefined) {
     return
   }
 
-  const now = await $.clock.now()
-  const agentIds = new Set((await read($, liveAtom)).agents.map(agent => agent.id))
-  await update($, tasksAtom, tasks => tasksFromReading(readings, tasks, agentIds, now))
+  await update($, tasksAtom, tasks => tasksStillRead(tasks, readings))
 }
 
 // What the turn record says; the band replaces isWorking with the engine's
 // own AbovePrompt prop.
 async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
-  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live] = await Promise.all([
+  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels] = await Promise.all([
     read($, turnAtom),
     read($, asksAtom),
     read($, tasksAtom),
@@ -293,9 +436,10 @@ async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
     read($, lastTurnAtom),
     read($, usageAtom),
     read($, liveAtom),
+    read($, agentModelsAtom),
   ])
 
-  return { isWorking: turn !== null, turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live }
+  return { isWorking: turn !== null, turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels }
 }
 
 async function togglePane($: EngineInterface): Promise<string | null> {
@@ -320,6 +464,7 @@ async function resetConversation($: EngineInterface): Promise<void> {
   await update($, asksAtom, () => [])
   await update($, lastTurnAtom, () => null)
   await update($, hasResponseAtom, () => false)
+  await update($, agentModelsAtom, () => ({}))
   await update($, usageAtom, usage => (usage === null ? usage : withoutConversation(usage)))
 }
 
@@ -361,22 +506,53 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Every agent's turn starts here too, but only the main loop's ends in the
+  // turn.complete that clears the record.
   on('turn.start', async ($, e, next) => {
-    const startedAt = await $.clock.now()
-    await update($, turnAtom, () => ({ turnId: e.turnId, startedAt, calls: [] }))
+    if (e.agentId === undefined) {
+      const startedAt = await $.clock.now()
+      await update($, turnAtom, () => ({ turnId: e.turnId, startedAt, calls: [] }))
+    }
+
     requestRefresh($)
 
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
+    const { agentId } = e
+
+    // Recorded as the request starts, so a long first step already shows it.
+    if (agentId !== undefined) {
+      await changeAgentModels($, models => withRequest(models, agentId, e.model, effortLabel(e.effort)))
+    }
+
     const step = yield* next(e)
 
     if (step.usage !== null) {
-      await addStepUsage($, step.usage, e.agentId === undefined)
+      await addStepUsage($, step.usage, agentId === undefined)
+    }
+
+    // A hook beneath this one may have sent another model than e.model; the
+    // response names the one that answered. Effort has no such answer.
+    if (agentId !== undefined && step.usage !== null) {
+      const answered = step.usage.model
+      await changeAgentModels($, models => withAnsweredModel(models, agentId, answered))
     }
 
     return step
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+
+    const { agentId, model } = started
+
+    if (agentId !== undefined) {
+      await changeAgentModels($, models => withSpawnModel(models, agentId, model))
+    }
+
+    return started
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -403,11 +579,19 @@ export const register: Register = on => {
     }
   })
 
+  // Background work is tracked only from the main loop, and only when its end
+  // can reach it: an agent's task notifies that agent, never this session's
+  // prompt.submit, and the agent's own status (waiting) already covers it.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (isAnswered(ran) && ran.result.backgroundTaskId !== undefined) {
-      await addTask($, ran.result.backgroundTaskId, 'shell', e.description ?? e.command)
+    if (
+      e.agentId === undefined &&
+      isAnswered(ran) &&
+      ran.result.backgroundTaskId !== undefined &&
+      ran.result.backgroundEndsWithFinalResponse !== true
+    ) {
+      await addTask($, ran.result.backgroundTaskId, 'shell', e.description ?? e.command, null)
     }
 
     return ran
@@ -416,8 +600,12 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (isAnswered(ran)) {
-      await addTask($, ran.result.taskId, 'monitor', e.description)
+    if (e.agentId === undefined && isAnswered(ran)) {
+      // The engine kills a monitor at its deadline; the expiry notice says so
+      // in prose, with no <status>.
+      const isPersistent = ran.result.persistent === true || ran.result.timeoutMs === PERSISTENT_MONITOR_TIMEOUT_MS
+      const runsForMs = isPersistent ? null : ran.result.timeoutMs
+      await addTask($, ran.result.taskId, 'monitor', e.description, runsForMs)
     }
 
     return ran
@@ -426,8 +614,8 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Workflow' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (isAnswered(ran)) {
-      await addTask($, ran.result.taskId, 'workflow', ran.result.workflowName ?? e.name ?? 'workflow')
+    if (e.agentId === undefined && isAnswered(ran)) {
+      await addTask($, ran.result.taskId, 'workflow', ran.result.workflowName ?? e.name ?? 'workflow', null)
     }
 
     return ran
@@ -436,8 +624,8 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const ran = await next(e)
 
-    if (isAnswered(ran) && 'taskId' in ran.result && ran.result.status === 'remote_launched') {
-      await addTask($, ran.result.taskId, 'remote', e.description)
+    if (e.agentId === undefined && isAnswered(ran) && 'taskId' in ran.result && ran.result.status === 'remote_launched') {
+      await addTask($, ran.result.taskId, 'remote', e.description, null)
     }
 
     requestRefresh($)
@@ -470,14 +658,16 @@ export const register: Register = on => {
     return entered
   })
 
+  // Only the main loop's Stop reconciles: it follows every tool.call of that
+  // loop, while an agent's SubagentStop runs alongside it and may carry a
+  // snapshot taken before a task the main loop just started.
   on('classic.Stop', async ($, e, next) => {
     await reconcileTasks($, e.background_tasks)
 
     return next(e)
   })
 
-  on('classic.SubagentStop', async ($, e, next) => {
-    await reconcileTasks($, e.background_tasks)
+  on('classic.SubagentStop', ($, e, next) => {
     requestRefresh($)
 
     return next(e)

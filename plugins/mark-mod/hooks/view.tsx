@@ -221,6 +221,10 @@ function workerName(worker: WorkerView): string {
   return clipCells(worker.kind === 'task' ? worker.description : worker.label, BAND_WORKER_NAME_CELLS)
 }
 
+function workerDetail(worker: WorkerView): string {
+  return worker.modelText === '' ? worker.ageText : `${worker.modelText} ${worker.ageText}`
+}
+
 function bandWorkers(kit: Kit, view: DashView): RenderElement | null {
   const { Text } = kit
   const workers = activeWorkers(view)
@@ -238,7 +242,7 @@ function bandWorkers(kit: Kit, view: DashView): RenderElement | null {
       {shown.map(worker => (
         <Text key={worker.id}>
           {ITEM_GAP}
-          {workerName(worker)} <Text dimColor>{worker.ageText}</Text>
+          {workerName(worker)} <Text dimColor>{workerDetail(worker)}</Text>
         </Text>
       ))}
       {more > 0 ? (
@@ -345,8 +349,9 @@ function paneWorker(kit: Kit, worker: WorkerView): RenderElement {
         </Text>
       </Box>
       <Box flexGrow={1} flexShrink={1}>
-        <Text dimColor wrap="truncate-end">
-          {worker.description}
+        <Text wrap="truncate-end">
+          <Text dimColor={isDim}>{worker.modelText === '' ? null : `${worker.modelText} `}</Text>
+          <Text dimColor>{worker.description}</Text>
         </Text>
       </Box>
       <Box width={PANE_AGE_COLUMNS} flexShrink={0} justifyContent="flex-end">

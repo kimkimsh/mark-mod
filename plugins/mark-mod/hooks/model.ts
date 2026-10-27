@@ -1,5 +1,7 @@
 import type {
   DashAgent,
+  DashAgentModel,
+  DashAgentModels,
   DashAgentStatus,
   DashCall,
   DashCounts,
@@ -74,7 +76,39 @@ export const RUNNING_TEXT = 'running'
 
 const ACTIVE_AGENT_STATUSES = new Set<DashAgentStatus>(['pending', 'running', 'waiting'])
 
-const SUBAGENT_TASK_KIND = 'subagent'
+const MODEL_ID_PREFIX = 'claude-'
+
+const MODEL_FAMILY_PATTERN = /^[a-z]+$/
+
+const MODEL_TEXT_JOINER = '·'
+
+const TEAMMATE_TEAM_SEPARATOR = '@'
+
+const TEAMS_DIR = 'teams'
+
+const ROSTER_FILE = 'config.json'
+
+const PANE_BACKEND = 'tmux'
+
+const TMUX = 'tmux'
+
+const TMUX_SOCKET_PATH_FLAG = '-S'
+
+const TMUX_SOCKET_NAME_FLAG = '-L'
+
+// $TMUX is `<socket>,<server pid>,<session>`.
+const TMUX_ENV_SEPARATOR = ','
+
+// The server the engine starts for its teammates when it runs outside tmux.
+const SWARM_SOCKET_PREFIX = 'claude-swarm-'
+
+// The engine sets remain-on-exit failed on a teammate's pane, so a pane whose
+// process failed stays listed, with pane_dead 1.
+const PANE_LISTING_ARGS = ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead}']
+
+const PANE_FIELD_SEPARATOR = ' '
+
+const PANE_DEAD_FLAG = '1'
 
 const NOTIFICATION_PATTERN = /<task-notification>([\s\S]*?)<\/task-notification>/g
 
@@ -140,6 +174,7 @@ export type WorkerView = {
   statusText: string
   ageText: string
   isNested: boolean
+  modelText: string
 }
 
 export type TokenView = {
@@ -179,6 +214,7 @@ export type DashSnapshot = {
   lastTurn: DashTurnEnd | null
   usage: DashUsage | null
   live: DashLive
+  agentModels: DashAgentModels
 }
 
 export type UsageCounts = {
@@ -196,7 +232,7 @@ export type UsageReading = {
   cost?: { usd: number }
 }
 
-type AgentReading = {
+export type AgentReading = {
   id: string
   description: string
   type: string
@@ -255,6 +291,97 @@ export function isTokensEmpty(tokens: DashTokens): boolean {
 
 export function isAgentActive(status: DashAgentStatus): boolean {
   return ACTIVE_AGENT_STATUSES.has(status)
+}
+
+export type PaneRoster = { leadPid: number | null; panes: Map<string, string> }
+
+type PaneMember = { agentId: string; tmuxPaneId: string }
+
+function isPaneMember(value: unknown): value is PaneMember {
+  if (!(value instanceof Object)) {
+    return false
+  }
+
+  const agentId = Object.getOwnPropertyDescriptor(value, 'agentId')?.value
+  const paneId = Object.getOwnPropertyDescriptor(value, 'tmuxPaneId')?.value
+
+  return (
+    Object.getOwnPropertyDescriptor(value, 'backendType')?.value === PANE_BACKEND &&
+    agentId === String(agentId) &&
+    paneId === String(paneId)
+  )
+}
+
+export function rosterPath(configDir: string, teammateId: string): string {
+  const team = teammateId.slice(teammateId.lastIndexOf(TEAMMATE_TEAM_SEPARATOR) + 1)
+
+  return `${configDir}/${TEAMS_DIR}/${team}/${ROSTER_FILE}`
+}
+
+// The engine's own record of a team, as 2.1.311 writes it: each member on a
+// tmux pane by its address and pane id. A file of any other shape names no
+// pane.
+export function paneRosterFromText(text: string): PaneRoster {
+  const roster: PaneRoster = { leadPid: null, panes: new Map() }
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return roster
+  }
+
+  if (!(parsed instanceof Object)) {
+    return roster
+  }
+
+  const leadProcess = Object.getOwnPropertyDescriptor(parsed, 'leadProcess')?.value
+  const pid = leadProcess instanceof Object ? Object.getOwnPropertyDescriptor(leadProcess, 'pid')?.value : undefined
+  const members = Object.getOwnPropertyDescriptor(parsed, 'members')?.value
+  roster.leadPid = Number.isFinite(pid) ? Number(pid) : null
+
+  for (const member of Array.isArray(members) ? members : []) {
+    if (isPaneMember(member)) {
+      roster.panes.set(member.agentId, member.tmuxPaneId)
+    }
+  }
+
+  return roster
+}
+
+// The engine splits the person's own tmux server when it runs inside one, and
+// otherwise starts one of its own named after the lead's pid; null when that
+// name is not known.
+export function paneListingArgv(tmuxEnv: string | undefined, leadPid: number | null): string[] | null {
+  if (tmuxEnv !== undefined && tmuxEnv !== '') {
+    const socket = tmuxEnv.split(TMUX_ENV_SEPARATOR)[0] ?? tmuxEnv
+
+    return [TMUX, TMUX_SOCKET_PATH_FLAG, socket, ...PANE_LISTING_ARGS]
+  }
+
+  return leadPid === null ? null : [TMUX, TMUX_SOCKET_NAME_FLAG, `${SWARM_SOCKET_PREFIX}${leadPid}`, ...PANE_LISTING_ARGS]
+}
+
+export function livePaneIds(listing: string): Set<string> {
+  const live = new Set<string>()
+
+  for (const line of listing.split('\n')) {
+    const [paneId, dead] = line.split(PANE_FIELD_SEPARATOR)
+
+    if (paneId !== undefined && paneId !== '' && dead !== PANE_DEAD_FLAG) {
+      live.add(paneId)
+    }
+  }
+
+  return live
+}
+
+// A pane teammate's list status is the last word it wrote in the roster, which
+// a pane that closes or dies leaves standing.
+export function withEndedPanes(agents: readonly AgentReading[], ended: ReadonlySet<string>): AgentReading[] {
+  return agents.map(agent =>
+    agent.teammateId !== undefined && ended.has(agent.teammateId) ? { ...agent, status: 'killed' } : agent,
+  )
 }
 
 export function isAskingTool(tool: string): boolean {
@@ -320,34 +447,96 @@ export function agentsFromReading(
   }))
 }
 
-// Agent loops are drawn from $.agent.list(); the same loops also appear in
-// background_tasks, so an entry naming a listed agent would show it twice.
-export function tasksFromReading(
-  readings: readonly TaskReading[],
-  previous: readonly DashTask[],
-  agentIds: ReadonlySet<string>,
-  now: number,
-): DashTask[] {
-  const known = new Map(previous.map(task => [task.id, task]))
-  const tasks: DashTask[] = []
+// Returns the map itself when nothing changes, so a caller can skip the write.
+function withAgentEntry(models: DashAgentModels, id: string, entry: DashAgentModel): DashAgentModels {
+  const known = models[id]
 
-  for (const reading of readings) {
-    if (reading.type === SUBAGENT_TASK_KIND || agentIds.has(reading.id)) {
-      continue
-    }
-
-    // A row keeps the name it was first drawn with.
-    const seen = known.get(reading.id)
-
-    tasks.push({
-      id: reading.id,
-      kind: reading.type,
-      description: seen?.description ?? (reading.description === '' ? (reading.command ?? reading.type) : reading.description),
-      startedAt: seen?.startedAt ?? now,
-    })
+  if (known !== undefined && known.model === entry.model && known.effort === entry.effort) {
+    return models
   }
 
-  return tasks
+  return { ...models, [id]: entry }
+}
+
+export function withAnsweredModel(models: DashAgentModels, id: string, model: string): DashAgentModels {
+  return withAgentEntry(models, id, { model, effort: models[id]?.effort ?? null })
+}
+
+// A spawn result and a request name a model only while none is known: the
+// answered one replaces it, and a spawn result may land after the agent's
+// first response.
+export function withSpawnModel(models: DashAgentModels, id: string, model: string): DashAgentModels {
+  return withAgentEntry(models, id, { model: models[id]?.model ?? model, effort: models[id]?.effort ?? null })
+}
+
+// A request with no effort runs a model without one, so its null replaces
+// the effort an earlier request asked for.
+export function withRequest(models: DashAgentModels, id: string, model: string, effort: string | null): DashAgentModels {
+  return withAgentEntry(models, id, { model: models[id]?.model ?? model, effort })
+}
+
+export function withoutAgentModels(models: DashAgentModels, ids: readonly string[]): DashAgentModels {
+  if (!ids.some(id => models[id] !== undefined)) {
+    return models
+  }
+
+  const kept: DashAgentModels = {}
+
+  for (const [id, model] of Object.entries(models)) {
+    if (!ids.includes(id)) {
+      kept[id] = model
+    }
+  }
+
+  return kept
+}
+
+// A request's effort is a level or an integer budget.
+export function effortLabel(effort: string | number | undefined): string | null {
+  if (effort === undefined) {
+    return null
+  }
+
+  return Number.isFinite(effort) ? formatTokens(Number(effort)) : String(effort)
+}
+
+// The family is what an Agent call picks a model by, so it is what a worker
+// row names. Ids carry it among version and date segments, under a
+// provider's prefix or not (`claude-haiku-5-5`, `claude-3-5-sonnet-20241022`,
+// `us.anthropic.claude-opus-...`); anything else is shown as it is.
+export function modelFamily(model: string): string {
+  const start = model.indexOf(MODEL_ID_PREFIX)
+
+  if (start < 0) {
+    return model
+  }
+
+  const segments = model.slice(start + MODEL_ID_PREFIX.length).split('-')
+
+  return segments.find(segment => MODEL_FAMILY_PATTERN.test(segment)) ?? model
+}
+
+function modelText(model: DashAgentModel | undefined): string {
+  if (model === undefined) {
+    return ''
+  }
+
+  const parts = [modelFamily(model.model)]
+
+  if (model.effort !== null) {
+    parts.push(model.effort)
+  }
+
+  return parts.join(MODEL_TEXT_JOINER)
+}
+
+// background_tasks lists every loop's work in the session, agents' included,
+// with no owner, and no Stop need follow the end of an agent's command; so it
+// only takes down a task the main loop was seen starting, and adds none.
+export function tasksStillRead(tasks: readonly DashTask[], readings: readonly TaskReading[]): DashTask[] {
+  const listed = new Set(readings.map(reading => reading.id))
+
+  return tasks.filter(task => listed.has(task.id))
 }
 
 // Rate-limit windows belong to the account, not the conversation: a reading
@@ -373,6 +562,10 @@ export function withoutTask(tasks: readonly DashTask[], id: string): DashTask[] 
 
 export function withoutTasks(tasks: readonly DashTask[], ids: readonly string[]): DashTask[] {
   return tasks.filter(task => !ids.includes(task.id))
+}
+
+export function isTaskOver(task: DashTask, now: number): boolean {
+  return task.endsBy !== null && task.endsBy <= now
 }
 
 function severityOf(usedPercent: number): Severity {
@@ -656,7 +849,7 @@ const AGENT_STATUS_TEXT: Record<DashAgentStatus, string> = {
   killed: 'stopped',
 }
 
-function agentView(agent: DashAgent, now: number): WorkerView {
+function agentView(agent: DashAgent, now: number, models: DashAgentModels): WorkerView {
   return {
     id: agent.id,
     kind: agent.isTeammate ? 'teammate' : 'subagent',
@@ -667,6 +860,7 @@ function agentView(agent: DashAgent, now: number): WorkerView {
     statusText: AGENT_STATUS_TEXT[agent.status],
     ageText: formatDuration(now - agent.firstSeenAt),
     isNested: agent.isNested,
+    modelText: modelText(models[agent.id]),
   }
 }
 
@@ -681,6 +875,7 @@ function taskView(task: DashTask, now: number): WorkerView {
     statusText: AGENT_STATUS_TEXT.running,
     ageText: formatDuration(now - task.startedAt),
     isNested: false,
+    modelText: '',
   }
 }
 
@@ -774,7 +969,7 @@ function activeFirst(a: WorkerView, b: WorkerView): number {
 
 export function buildView(snapshot: DashSnapshot): DashView {
   const now = snapshot.live.now
-  const agents = snapshot.live.agents.map(agent => agentView(agent, now))
+  const agents = snapshot.live.agents.map(agent => agentView(agent, now, snapshot.agentModels))
   const subagents = agents.filter(agent => agent.kind === 'subagent').sort(activeFirst)
   const teammates = agents.filter(agent => agent.kind === 'teammate')
   const tasks = snapshot.tasks.map(task => taskView(task, now))
