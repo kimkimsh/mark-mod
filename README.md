@@ -7,7 +7,7 @@ This README is for a Claude Code user who wants to install the mod and read what
 ```
   ● Working  Bash running                                                    tokens 1.09M $0.14 /dash
   Context ████████▉░ 89% left   5-hour ████▌░░░░░ 45% left · runs out in 1h35m at this pace   Weekly ████████▎░ 82% left · resets in 6d5h
-  subagents 1 · background 1   Explore 6s   Run sleep 40 6s
+  subagents 1 · background 1   Explore haiku·low 6s   Run sleep 40 6s
 ```
 
 ## Install
@@ -80,21 +80,22 @@ On a narrow terminal the bars go first, then the weekly reset note, then the 5-h
 
 ### Row 3: what is running
 
-Running subagents, teammates (`teammates 1/3 working` means one of three is working) and background tasks, each with how long it has run. The row disappears when nothing is running.
+Running subagents, teammates (`teammates 1/3 working` means one of three is working) and background tasks, each with how long it has run. An agent also shows the model family and reasoning effort it runs at: `Explore haiku·low 6s` is an Explore subagent on Haiku at low effort. The row disappears when nothing is running.
 
 ## The `/dash` pane
 
 - **Usage**: context (tokens used / window size), the 5-hour and weekly limits, and any other limit the API reports.
 - **Tokens**: the total and cost, split into input, output, cache read and cache write, and into the main conversation versus agents (subagents and teammates).
-- **Subagents / Teammates / Background**: one row per running item with its age. Finished subagents fold into one line such as `done 3 · failed 1`.
+- **Subagents / Teammates / Background**: one row per running item with its age; an agent's row starts its description with its model and effort (`haiku·low list files`). Finished subagents fold into one line such as `done 3 · failed 1`.
 
 ## Good to know
 
 - **Tokens** add up every API request made after the mod loaded, for the main conversation and all agents: input, output, cache read and cache write. Cache reads are counted because they are tokens the session used; since every request re-reads the cached conversation, the total grows quickly as a conversation gets long. `/dash` shows the breakdown.
 - Reopening a session with `claude --resume`, or switching to another with `/resume`, continues that session's saved count. `/clear` starts a new session, so the count starts again from 0.
 - An agent's or task's age counts from when the mod first saw it.
+- **Background** is work the main conversation started while the mod was loaded. A command or monitor that a subagent or teammate starts shows on that agent's row instead, as waiting, because only that agent hears when it ends.
 - **Permission prompts are not shown as a state.** Claude Code reports when a permission dialog opens but not when it closes, so after you approve a long command the band could not tell the dialog from the command running. The dialog itself appears where the band is.
-- Teammates running in their own terminal pane (a tmux split) are counted, but their tokens are not visible to this session.
+- Teammates running in their own terminal pane (a tmux split) are counted, but their tokens are not visible to this session, and their row shows the model without an effort. A teammate whose pane is closed or has died shows as stopped: while one works, the mod asks tmux about its pane once a second.
 
 ## Troubleshooting
 

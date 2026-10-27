@@ -15,8 +15,9 @@ Shown at all times, above the prompt:
 | Weekly limit left | `rateLimits[kind=seven_day]` from the same |
 | Session tokens | sum of `turn.step` result `usage` (main loop + every subagent loop) |
 | Session cost | `cost.usd` from the same push |
-| Subagents / teammates | `$.agent.list()` (teammates carry `teammateId`) |
-| Background tasks | `tool.call` results (`backgroundTaskId`, `taskId`), task-notification prompts, reconciled on `classic.Stop` / `classic.SubagentStop` `background_tasks` |
+| Subagents / teammates | `$.agent.list()` (teammates carry `teammateId`); a pane teammate's pane, by its team's roster and `tmux list-panes` |
+| An agent's model and effort | `agent.spawn` result `model` (resolved at spawn); each `turn.step` in the agent's loop (`e.model`, `e.effort`) |
+| Background tasks | main-loop `tool.call` results (`backgroundTaskId`, `taskId`), task-notification prompts, taken down by `classic.Stop` `background_tasks` where it runs |
 
 A pane (`/dash`) shows the same data itemised: every agent and task with its
 age, token breakdown, and limit reset times.
@@ -66,9 +67,53 @@ band would be.
 - **A notification ends a task only by saying so.** A task-notification removes
   its task when its status is completed, failed or killed; any other word (a
   monitor's event) leaves it to the Stop snapshot. One prompt may carry several.
-- **The Stop snapshot is the truth** about background work in flight, minus the
-  agent loops `$.agent.list()` already shows (type `subagent`, or an id the list
-  names). A known task keeps the name and start time it was first drawn with.
+- **A monitor ends by its deadline too.** The engine kills a monitor when its
+  `timeoutMs` runs out, and the expiry notice is an event with no `<status>`,
+  so a monitor's task leaves once its start plus `timeoutMs` has passed (the
+  1 s tick checks). A persistent monitor has no deadline.
+- **The Stop snapshot only takes work down.** `background_tasks` lists every
+  loop's work in the session (agents' commands, each teammate as an entry of
+  its own) with no owner, and no Stop need follow the end of an agent's
+  command; so a task the main loop was seen starting leaves when the main
+  loop's `classic.Stop` no longer lists it, and an entry nothing was seen
+  starting is never added. Work begun before the mod loaded is therefore not
+  shown. `classic.SubagentStop` does not reconcile: it runs alongside the main
+  loop, and its snapshot may predate a task the main loop has just started.
+  The snapshot is not always there: where an organization manages Claude Code
+  (a Team or Enterprise account), the engine's `cc-plugin-sec-default` skips
+  every `classic.*` hook of a plugin the person installed, so a task leaves
+  only by its notification, its deadline or a TaskStop.
+- **Only work whose end reaches the main loop is tracked.** A command, monitor,
+  workflow or remote agent an agent starts notifies that agent, never the main
+  loop's `prompt.submit`; without the Stop snapshot nothing would ever take it
+  down. The agent's own row covers it (`waiting` is on background work it
+  owns, for a subagent and an in-process teammate alike). A command whose
+  result says `backgroundEndsWithFinalResponse` dies with its caller's final
+  response and sends no notification, so it is not tracked either.
+- **A pane teammate's word outlives its pane.** Its list status is the last
+  word it wrote in its team's roster, and a pane that closes or dies leaves
+  `running` standing. While one works, each refresh reads the roster
+  (`teams/<team>/config.json` under `CLAUDE_CONFIG_DIR` or `~/.claude`: the
+  member's `backendType: "tmux"` and `tmuxPaneId`, and `leadProcess.pid`) and
+  lists the panes of the tmux server the engine put it on: the person's own
+  (`-S`, the socket `$TMUX` names first) when the engine runs inside tmux,
+  otherwise its own (`-L claude-swarm-<lead pid>`), which exits with its last
+  pane and leaves its socket file behind. A pane missing, or kept dead by the
+  `remain-on-exit failed` the engine sets, shows the teammate as stopped; a
+  roster that cannot be read, or a tmux that cannot be run, leaves the list's
+  word standing.
+- **Only the main loop's turn is the turn.** `turn.start` fires for every
+  agent's turn as well, and only the main loop's `turn.complete` clears the
+  turn record, so an agent's start is never recorded as the turn.
+- **An agent's model is the one that answered; its effort is what its latest
+  request asked for.** Until a response arrives the row names the model the
+  spawn resolved or the first request named, whichever came first; each
+  response of the agent's loop (`turn.step`) then names the model that
+  answered, which a hook may have changed from the request. A request with no
+  effort runs a model without one, so the row shows the model alone; so does
+  a teammate in its own pane, whose requests this session never sees. An
+  agent's entry leaves when the list stops naming it, not before the list
+  first names it.
 - **Stale main turn.** The band trusts the engine's `isWorking` over the turn
   record, so a missed `turn.complete` cannot pin "working" on screen.
 
@@ -116,7 +161,7 @@ with the engine's footer):
 ```
   ● Working  thinking                                                    tokens 1.09M $0.14 /dash
   Context ████████▉░ 89% left   5-hour ████▌░░░░░ 45% left · runs out in 1h35m at this pace   Weekly ████████▎░ 82% left · resets in 6d5h
-  subagents 1 · background 1   Explore 6s   Run sleep 40 6s
+  subagents 1 · background 1   Explore haiku·low 6s   Run sleep 40 6s
 ```
 
 Every meter is a fuel gauge: the bar is what is **left**, the number beside it
