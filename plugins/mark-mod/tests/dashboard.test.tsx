@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { AgentInfo, On, RenderSurface, SessionUsage, TurnStepInput } from 'claude-code'
+import type { AgentInfo, AgentSpawnInput, On, RenderSurface, SessionMessage, SessionUsage, TurnStepInput } from 'claude-code'
 
 const PLUGIN = 'mark-mod'
 
@@ -18,6 +18,8 @@ type World = {
   isListBroken: boolean
   usage: SessionUsage
   openPanes: string[]
+  // Open but undrawn, as an unasked open leaves a pane on a narrow terminal.
+  undrawnPanes: Set<string>
   env: Map<string, string>
 }
 
@@ -30,6 +32,7 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
     isListBroken: false,
     usage: { startedAt: START, context: { window: 200_000 }, rateLimits: [] },
     openPanes: [],
+    undrawnPanes: new Set(),
     env: new Map(),
   }
 
@@ -51,10 +54,14 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
   on('session.usage', () => ({ value: world.usage }))
   on('env.get', ($, e) => ({ value: world.env.get(e.name) }))
   on('ui.panes', () => ({
-    value: world.openPanes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+    value: world.openPanes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: !world.undrawnPanes.has(id) })),
   }))
   on('ui.open', ($, e) => {
-    world.openPanes.push(e.id)
+    if (!world.openPanes.includes(e.id)) {
+      world.openPanes.push(e.id)
+    }
+
+    world.undrawnPanes.delete(e.id)
 
     return { value: { isPlaced: true } }
   })
@@ -97,6 +104,8 @@ async function band($: Engine, surface: RenderSurface, isWorking: boolean, colum
   })
 }
 
+// The kit reads what was drawn, never the surface's paint: rows run together
+// and nothing is cut to width, so a test of layout checks what is chosen.
 async function bandText($: Engine, isWorking: boolean, columns: number): Promise<string> {
   const ui = await band($, 'terminal', isWorking, columns, 5)
   const text = (await ui.find({ type: 'Box' }))?.text ?? ''
@@ -120,9 +129,43 @@ async function paneText($: Engine, columns: number): Promise<string> {
   return text
 }
 
+// A hook of the test's that answers only once the test opens it.
+type Gate = { wait: Promise<void>; open: () => void }
+
+function gate(): Gate {
+  let open: () => void = () => {}
+
+  const wait = new Promise<void>(resolve => {
+    open = resolve
+  })
+
+  return { wait, open }
+}
+
 // A call made inside an agent's loop; the kit's call types leave the
 // engine-stamped agentId out, so it rides in by spread.
 const IN_AGENT = { agentId: 'a1' }
+
+// An agent started before the turn under test.
+const IN_EARLIER_AGENT = { agentId: 'a0' }
+
+const EXPLORE_SPAWN: AgentSpawnInput = {
+  tool_use_id: 'ag-1',
+  prompt: 'list files',
+  description: 'list files',
+  subagentType: 'Explore',
+  provider: { plugin: 'engine', tier: 'core' },
+  parentModel: 'claude-opus-5-5',
+  background: true,
+  fork: false,
+}
+
+const EXPLORER = { id: 'a1', description: 'list files', type: 'Explore', status: 'running' } as const
+
+const DONE = { stdout: '', stderr: '', interrupted: false }
+
+// A compaction leaves at least one message: its summary.
+const SUMMARY: SessionMessage[] = [{ role: 'user', text: 'summary', toolUses: [] }]
 
 const HOME = '/home/u'
 
@@ -181,14 +224,22 @@ function fakeTmux(on: On, world: World, tmuxEnv: string | undefined): Tmux {
   return tmux
 }
 
+type RateLimitReading = SessionUsage['rateLimits'][number]
+
+const FIVE_HOUR_READING: RateLimitReading = { kind: 'five_hour', percentUsed: 33, resetsAt: new Date(START + 2 * 3_600_000).toISOString() }
+
+const WEEKLY_RESETS_AT = new Date(START + 6 * 86_400_000).toISOString()
+
 const MEASURED: SessionUsage = {
   startedAt: START,
   context: { tokens: 92_100, window: 200_000, percent: 46 },
-  rateLimits: [
-    { kind: 'five_hour', percentUsed: 33, resetsAt: new Date(START + 2 * 3_600_000).toISOString() },
-    { kind: 'seven_day', percentUsed: 13, resetsAt: new Date(START + 6 * 86_400_000).toISOString() },
-  ],
+  rateLimits: [FIVE_HOUR_READING, { kind: 'seven_day', percentUsed: 13, resetsAt: WEEKLY_RESETS_AT }],
   cost: { usd: 3.41 },
+}
+
+const WEEKLY_NEARLY_SPENT: SessionUsage = {
+  ...MEASURED,
+  rateLimits: [FIVE_HOUR_READING, { kind: 'seven_day', percentUsed: 90, resetsAt: WEEKLY_RESETS_AT }],
 }
 
 // The engine's session.measure carries what $.session.usage() answers at
@@ -204,13 +255,7 @@ async function measure($: Engine, world: World, usage: SessionUsage): Promise<vo
   await world.clock.settle()
 }
 
-async function step($: Engine, agentId: string | undefined): Promise<void> {
-  const input: TurnStepInput = { turnId: 'turn-1', index: 0, model: 'claude-opus-5-5', messageCount: 1 }
-
-  if (agentId !== undefined) {
-    input.agentId = agentId
-  }
-
+async function runStep($: Engine, input: TurnStepInput): Promise<void> {
   const stream = $.turn.step(input)
 
   for await (const chunk of stream) {
@@ -218,8 +263,18 @@ async function step($: Engine, agentId: string | undefined): Promise<void> {
   }
 }
 
+async function step($: Engine, agentId: string | undefined): Promise<void> {
+  const input: TurnStepInput = { turnId: 'turn-1', index: 0, model: 'claude-opus-5-5', messageCount: 1 }
+
+  if (agentId !== undefined) {
+    input.agentId = agentId
+  }
+
+  await runStep($, input)
+}
+
 describe('band', () => {
-  test('a fresh session reads as ready, with limits not yet measured', async ($, on) => {
+  test('a fresh session reads as ready; context says it is not measured, unread limits stay off', async ($, on) => {
     boot(on, SESSION_ID)
     await start($)
 
@@ -228,7 +283,8 @@ describe('band', () => {
       const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
       expect(text).toContain('Ready')
-      expect(text).toContain('not measured yet')
+      expect(text).toContain('Context not measured yet')
+      expect(text).not.toContain('5-hour')
       expect(await ui.find({ type: 'Button', key: 'dash' })).toBeDefined()
       await ui.unmount()
     }
@@ -242,7 +298,7 @@ describe('band', () => {
 
     expect(text).toContain('54% left')
     expect(text).toContain('67% left')
-    expect(text).toContain('resets in 2h00m')
+    expect(text).toContain('resets in 2h 00m')
     expect(text).toContain('87% left')
     expect(text).toContain('$3.41')
   })
@@ -288,16 +344,12 @@ describe('band', () => {
     expect(await bandText($, false, 140)).toContain('90% left')
   })
 
-  test('a running turn shows the tool in flight, and a plan awaiting approval outranks it', async ($, on) => {
+  test('a running turn names nothing between tools, and a plan awaiting approval outranks it', async ($, on) => {
     const world = boot(on, SESSION_ID)
-    let release: () => void = () => {}
-
-    const held = new Promise<void>(resolve => {
-      release = resolve
-    })
+    const approval = gate()
 
     on('tool.call', { tool: 'ExitPlanMode' }, async () => {
-      await held
+      await approval.wait
 
       return { result: { plan: 'p', isAgent: false } }
     })
@@ -305,20 +357,44 @@ describe('band', () => {
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
     await world.clock.advance(72_000)
 
-    expect(await bandText($, true, 140)).toContain('thinking')
+    expect(await bandText($, true, 140)).toContain('● Working/dash')
 
     const asking = $.tool.call({ tool: 'ExitPlanMode', tool_use_id: 'plan-1' })
-    await world.clock.settle()
-    const text = await bandText($, true, 140)
+    await world.clock.advance(20_000)
 
-    expect(text).toContain('Needs you')
-    expect(text).toContain('plan approval')
+    expect(await bandText($, true, 140)).toContain('Needs your plan approval  waiting 20s')
 
-    release()
+    approval.open()
     await asking
     await world.clock.settle()
 
-    expect(await bandText($, true, 140)).toContain('Working')
+    const text = await bandText($, true, 140)
+
+    expect(text).toContain('Working')
+    expect(text).not.toContain('Needs your')
+  })
+
+  test('a running turn names what its tool is doing, until the tool returns', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    const command = gate()
+
+    on('tool.call', { tool: 'Bash' }, async () => {
+      await command.wait
+
+      return { result: DONE }
+    })
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    const running = $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', description: 'Run the tests' })
+    await world.clock.settle()
+
+    expect(await bandText($, true, 140)).toContain('Working  running npm test')
+
+    command.open()
+    await running
+    await world.clock.settle()
+
+    expect(await bandText($, true, 140)).not.toContain('npm test')
   })
 
   test('the engine saying nothing runs beats a stale turn record', async ($, on) => {
@@ -339,25 +415,75 @@ describe('band', () => {
 
     await $.turn.start({ text: 'go', turnId: 'turn-2' })
     await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'turn-2', reason: 'answer' })
+    const text = await bandText($, false, 140)
 
-    expect(await bandText($, false, 140)).toContain('All done')
+    expect(text).toContain('✓ Done  just now')
+    expect(text).not.toContain('Interrupted')
+  })
+
+  test('the reply names the files it changed and the subagents it started, and nothing an older agent did', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Write', tool_use_id: 'w1', file_path: '/w/d.txt', content: 'y' })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/w/d.txt', old_string: 'y', new_string: 'z' })
+    await $.agent.spawn(EXPLORE_SPAWN)
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e2', file_path: '/w/c.txt', old_string: 'a', new_string: 'b', ...IN_AGENT })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e3', file_path: '/w/x.txt', old_string: 'a', new_string: 'b', ...IN_EARLIER_AGENT })
+    await $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/w/y.txt' })
+    await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
+
+    expect(await bandText($, false, 140)).toContain('Done  just now, edited 2 files, used 1 subagent')
+  })
+
+  test('a workflow\'s agents work for its run, not for the reply that started it', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'wf-agent' }))
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    await $.agent.spawn({ ...EXPLORE_SPAWN, workflow: { runId: 'wf_1', agentIndex: 1 } })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/w/c.txt', old_string: 'a', new_string: 'b', agentId: 'wf-agent' })
+    await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
+    const text = await bandText($, false, 140)
+
+    expect(text).toContain('Done  just now')
+    expect(text).not.toContain('edited')
+    expect(text).not.toContain('used')
+  })
+
+  test('an agent\'s turn neither restarts nor ends the main turn\'s record', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/w/a.txt', old_string: 'a', new_string: 'b' })
+    await $.turn.start({ text: 'look', turnId: 'turn-a', agentId: 'a1' })
+    await $.turn.complete({ answer: 'x', durationMs: 2_000, isAborted: false, turnId: 'turn-a', reason: 'answer', agentId: 'a1' })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e2', file_path: '/w/b.txt', old_string: 'a', new_string: 'b' })
+    await $.turn.complete({ answer: 'ok', durationMs: 1_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
+
+    expect(await bandText($, false, 140)).toContain('edited 2 files')
+    expect(await paneText($, 90)).toContain('just now, took 1s, edited 2 files')
   })
 
   test('a subagent still running after the turn is what the session waits on', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'running' }]
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
     await world.clock.advance(42_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('Waiting on subagents')
-    expect(text).toContain('Explore 42s')
+    expect(text).toContain('Waiting on 1 subagent')
+    expect(text).toContain('Subagents   list files 42s')
 
-    world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'completed' }]
+    world.agents = [{ ...EXPLORER, status: 'completed' }]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('Waiting on subagents')
+    expect(await bandText($, false, 140)).not.toContain('Waiting on')
   })
 
   test('a running agent names the model it was started on, then the effort its requests ask for', async ($, on) => {
@@ -369,32 +495,17 @@ describe('band', () => {
       return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
     })
     await start($)
-    await $.agent.spawn({
-      tool_use_id: 'ag-1',
-      prompt: 'list files',
-      description: 'list files',
-      subagentType: 'Explore',
-      provider: { plugin: 'engine', tier: 'core' },
-      parentModel: 'claude-opus-5-5',
-      background: true,
-      fork: false,
-    })
-    world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'running' }]
+    await $.agent.spawn(EXPLORE_SPAWN)
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('Explore haiku 0s')
+    expect(await bandText($, false, 140)).toContain('list files (haiku) 0s')
 
-    const stream = $.turn.step({ turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
-
-    for await (const chunk of stream) {
-      expect(chunk).toBeDefined()
-    }
-
+    await runStep($, { turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
     await world.clock.advance(5_000)
 
-    expect(await bandText($, false, 140)).toContain('Explore haiku·low 5s')
-
-    expect(await paneText($, 90)).toContain('haiku·low list files')
+    expect(await bandText($, false, 140)).toContain('list files (haiku, low effort) 5s')
+    expect(await paneText($, 90)).toContain('Haiku 5.5, low effort')
   })
 
   test('the model that answered is what the row names, whatever the request asked for', async ($, on) => {
@@ -413,27 +524,12 @@ describe('band', () => {
       }
     })
     await start($)
-
-    const stream = $.turn.step({ turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
-
-    for await (const chunk of stream) {
-      expect(chunk).toBeDefined()
-    }
-
-    await $.agent.spawn({
-      tool_use_id: 'ag-1',
-      prompt: 'list files',
-      description: 'list files',
-      subagentType: 'Explore',
-      provider: { plugin: 'engine', tier: 'core' },
-      parentModel: 'claude-opus-5-5',
-      background: true,
-      fork: false,
-    })
-    world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'running' }]
+    await $.agent.spawn(EXPLORE_SPAWN)
+    await runStep($, { turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('Explore sonnet·low')
+    expect(await bandText($, false, 140)).toContain('list files (sonnet, low effort)')
   })
 
   // A teammate's spawn result can land before the list first names it.
@@ -441,26 +537,16 @@ describe('band', () => {
     const world = boot(on, SESSION_ID)
     on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
     await start($)
-    await $.agent.spawn({
-      tool_use_id: 'ag-1',
-      prompt: 'list files',
-      description: 'list files',
-      subagentType: 'Explore',
-      provider: { plugin: 'engine', tier: 'core' },
-      parentModel: 'claude-opus-5-5',
-      background: true,
-      fork: false,
-    })
+    await $.agent.spawn(EXPLORE_SPAWN)
     await world.clock.advance(1_000)
-    const explorer = { id: 'a1', description: 'list files', type: 'Explore', status: 'running' } as const
-    world.agents = [explorer]
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('Explore haiku')
+    expect(await bandText($, false, 140)).toContain('list files (haiku)')
 
     world.agents = []
     await world.clock.advance(1_000)
-    world.agents = [explorer]
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
 
     expect(await bandText($, false, 140)).not.toContain('haiku')
@@ -476,8 +562,10 @@ describe('band', () => {
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('Waiting on teammates')
-    expect(text).toContain('teammates 1/2')
+    expect(text).toContain('Waiting on 1 teammate')
+    expect(text).toContain('Teammates   scout')
+    expect(text).not.toContain('critic')
+    expect(await paneText($, 90)).toContain('1 working, 1 idle')
   })
 
   // A pane teammate's list status is the roster's last word, which a pane
@@ -490,18 +578,18 @@ describe('band', () => {
     world.agents = [PANE_TEAMMATE]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('teammates 1/1 working')
+    expect(await bandText($, false, 140)).toContain('Waiting on 1 teammate')
     expect(tmux.argv).toEqual(['tmux', '-S', '/tmp/tmux-1000/default', 'list-panes', '-a', '-F', '#{pane_id} #{pane_dead}'])
 
     tmux.listing = { exitCode: 0, stdout: '%0 0\n%5 1\n' }
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('working')
+    expect(await bandText($, false, 140)).not.toContain('Waiting on')
 
     tmux.listing = { exitCode: 0, stdout: '%0 0\n' }
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('working')
+    expect(await bandText($, false, 140)).not.toContain('Waiting on')
     expect(await paneText($, 90)).toContain('stopped')
   })
 
@@ -514,13 +602,13 @@ describe('band', () => {
     world.agents = [PANE_TEAMMATE]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('teammates 1/1 working')
+    expect(await bandText($, false, 140)).toContain('Waiting on 1 teammate')
     expect(tmux.argv).toEqual(['tmux', '-L', `claude-swarm-${LEAD_PID}`, 'list-panes', '-a', '-F', '#{pane_id} #{pane_dead}'])
 
     tmux.listing = { exitCode: 1, stdout: '' }
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('working')
+    expect(await bandText($, false, 140)).not.toContain('Waiting on')
   })
 
   test('where tmux cannot be asked, a pane teammate keeps the list\'s word', async ($, on) => {
@@ -531,21 +619,23 @@ describe('band', () => {
     world.agents = [PANE_TEAMMATE]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('teammates 1/1 working')
+    expect(await bandText($, false, 140)).toContain('Waiting on 1 teammate')
   })
 
   test('a backgrounded command is tracked until its notification arrives', async ($, on) => {
     const world = boot(on, SESSION_ID)
 
     on('tool.call', () => ({
-      result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-1' },
+      result: { ...DONE, backgroundTaskId: 'bg-1' },
     }))
     on('prompt.submit', ($, e) => ({ text: e.text }))
     await start($)
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
     await world.clock.advance(1_000)
+    const text = await bandText($, false, 140)
 
-    expect(await bandText($, false, 140)).toContain('Waiting on background')
+    expect(text).toContain('Waiting on 1 shell')
+    expect(text).toContain('Background   npm test 1s')
 
     await $.prompt.submit({
       text: '<task-notification>\n<task-id>bg-1</task-id>\n<status>completed</status>\n</task-notification>',
@@ -553,7 +643,7 @@ describe('band', () => {
       origin: { kind: 'task-notification' },
     })
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
   })
 
   // No classic.* here, as where an organization manages Claude Code: an
@@ -561,7 +651,7 @@ describe('band', () => {
   test('a command an agent backgrounds is the agent\'s to wait on, not the session\'s', async ($, on) => {
     const world = boot(on, SESSION_ID)
     on('tool.call', { tool: 'Bash' }, () => ({
-      result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-a' },
+      result: { ...DONE, backgroundTaskId: 'bg-a' },
     }))
     on('tool.call', { tool: 'Monitor' }, () => ({ result: { taskId: 'mon-a', timeoutMs: 60_000, persistent: false } }))
     on('tool.call', { tool: 'Workflow' }, () => ({ result: { status: 'async_launched', taskId: 'wf-a', workflowName: 'sweep' } }))
@@ -577,8 +667,8 @@ describe('band', () => {
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('Waiting on subagents')
-    expect(text).not.toContain('background')
+    expect(text).toContain('Waiting on 1 subagent')
+    expect(text).not.toContain('Background')
   })
 
   // As 2.1.311 sends it where classic.* runs: the snapshot lists every loop's
@@ -587,7 +677,7 @@ describe('band', () => {
     const world = boot(on, SESSION_ID)
     on('classic.Stop', () => ({}))
     on('tool.call', () => ({
-      result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b0ojyy9gl' },
+      result: { ...DONE, backgroundTaskId: 'b0ojyy9gl' },
     }))
     await start($)
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'sleep 25', run_in_background: true, ...IN_AGENT })
@@ -600,8 +690,10 @@ describe('band', () => {
     })
     world.agents = [{ ...sleeper, status: 'idle' }]
     await world.clock.advance(1_000)
+    const text = await bandText($, false, 140)
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(text).not.toContain('Background')
+    expect(text).not.toContain('Waiting on')
   })
 
   // An agent's SubagentStop runs alongside the main loop, so its snapshot may
@@ -609,7 +701,7 @@ describe('band', () => {
   test('an agent\'s stop does not take down the main loop\'s work', async ($, on) => {
     const world = boot(on, SESSION_ID)
     on('classic.SubagentStop', () => ({}))
-    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-1' } }))
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { ...DONE, backgroundTaskId: 'bg-1' } }))
     await start($)
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
     await $.classic.SubagentStop({
@@ -621,27 +713,27 @@ describe('band', () => {
     })
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).toContain('background 1')
+    expect(await bandText($, false, 140)).toContain('Waiting on 1 shell')
   })
 
   test('a command that ends with its caller\'s final response is never waited on', async ($, on) => {
     const world = boot(on, SESSION_ID)
     on('classic.Stop', () => ({}))
     on('tool.call', () => ({
-      result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-1', backgroundEndsWithFinalResponse: true },
+      result: { ...DONE, backgroundTaskId: 'bg-1', backgroundEndsWithFinalResponse: true },
     }))
     await start($)
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
 
     await $.classic.Stop({
       stop_hook_active: false,
       background_tasks: [{ id: 'bg-1', type: 'shell', status: 'running', description: 'npm test', command: 'npm test' }],
     })
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
   })
 
   // A monitor's expiry notice carries no <status>; with no classic.* the
@@ -652,12 +744,14 @@ describe('band', () => {
     await start($)
     await $.tool.call({ tool: 'Monitor', tool_use_id: 'm1', description: 'never ends', timeout_ms: 5_000 })
     await world.clock.advance(1_000)
+    const text = await bandText($, false, 140)
 
-    expect(await bandText($, false, 140)).toContain('never ends')
+    expect(text).toContain('Waiting on 1 monitor')
+    expect(text).toContain('never ends')
 
     await world.clock.advance(5_000)
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
   })
 
   test('a notification that does not end its task leaves it running', async ($, on) => {
@@ -692,16 +786,16 @@ describe('band', () => {
     })
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('background 1')
-    expect(text).toContain('watch CI')
+    expect(text).toContain('Waiting on 1 monitor')
+    expect(text).toContain('Background   watch CI')
 
     await $.classic.Stop({ stop_hook_active: false })
 
-    expect(await bandText($, false, 140)).toContain('background 1')
+    expect(await bandText($, false, 140)).toContain('Waiting on 1 monitor')
 
     await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
   })
 
   // As 2.1.311 sends it: the teammate's task id is neither its list id nor
@@ -719,7 +813,7 @@ describe('band', () => {
       background_tasks: [{ id: 'tnonmf77g', type: 'teammate', status: 'running', description: 'teammate probe' }],
     })
 
-    expect(await bandText($, false, 140)).not.toContain('background')
+    expect(await bandText($, false, 140)).not.toContain('Background')
   })
 
   test('narrow bands drop the bars, short bands drop rows', async ($, on) => {
@@ -758,7 +852,7 @@ describe('band', () => {
 })
 
 describe('band layout', () => {
-  test('values come first; the weekly reset note and the bars give way to width', async ($, on) => {
+  test('values come first; reset notes, then bars, then whole healthy gauges give way to width', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
     await measure($, world, MEASURED)
@@ -766,21 +860,79 @@ describe('band layout', () => {
     const wide = await bandText($, false, 140)
 
     expect(wide).toContain('█')
-    expect(wide).toContain('resets in 2h00m')
-    expect(wide).toContain('resets in 6d0h')
+    expect(wide).toContain('resets in 2h 00m')
+    expect(wide).toContain('resets in 6d 0h')
 
     const medium = await bandText($, false, 74)
 
     expect(medium).not.toContain('█')
-    expect(medium).toContain('resets in 2h00m')
-    expect(medium).not.toContain('resets in 6d0h')
+    expect(medium).toContain('resets in 2h 00m')
+    expect(medium).not.toContain('resets in 6d 0h')
     expect(medium).toContain('87% left')
 
     const narrow = await bandText($, false, 50)
 
     expect(narrow).not.toContain('resets in')
-    expect(narrow).toContain('87% left')
+    expect(narrow).toContain('54% left')
+    expect(narrow).toContain('67% left')
+    expect(narrow).not.toContain('87% left')
     expect(narrow).not.toContain('/dash')
+  })
+
+  test('a window other than 5-hour and Weekly is the pane\'s, and costs the band no bars', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await measure($, world, {
+      ...MEASURED,
+      rateLimits: [...MEASURED.rateLimits, { kind: 'spend_limit', percentUsed: 20 }, { kind: 'seven_day_sonnet', percentUsed: 4 }],
+    })
+    const text = await bandText($, false, 140)
+
+    expect(text).toContain('█')
+    expect(text).not.toContain('Spend limit')
+    expect(text).not.toContain('Seven day sonnet')
+    expect(await paneText($, 90)).toContain('Seven day sonnet')
+  })
+
+  test('a gauge that needs attention outlasts a narrow band and a folded one', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await measure($, world, WEEKLY_NEARLY_SPENT)
+
+    const narrow = await bandText($, false, 50)
+
+    expect(narrow).toContain('Weekly ⚠ 10% left')
+    expect(narrow).not.toContain('67% left')
+
+    const ui = await band($, 'terminal', false, 140, 1)
+    const folded = (await ui.find({ type: 'Box' }))?.text ?? ''
+    await ui.unmount()
+
+    expect(folded).toContain('⚠ Weekly 10% left')
+    expect(folded).not.toContain('Context')
+  })
+
+  test('workers that do not fit fold into a count instead of being cut', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.agents = [
+      { ...EXPLORER, id: 'a1', description: 'Find callers of buildView today' },
+      { ...EXPLORER, id: 'a2', description: 'Review the band layout code' },
+      { ...EXPLORER, id: 'a3', description: 'Trace the refresh loop path' },
+    ]
+    await world.clock.advance(1_000)
+
+    const wide = await bandText($, false, 140)
+
+    expect(wide).toContain('Review the band')
+    expect(wide).toContain('Trace the refresh')
+    expect(wide).not.toContain('more')
+
+    const narrow = await bandText($, false, 80)
+
+    expect(narrow).toContain('Find callers of buildVi… 0s')
+    expect(narrow).not.toContain('Review the band')
+    expect(narrow).toContain('+2 more')
   })
 
   test('only idle teammates leave no worker row', async ($, on) => {
@@ -791,7 +943,7 @@ describe('band layout', () => {
     ]
     await world.clock.advance(1_000)
 
-    expect(await bandText($, false, 140)).not.toContain('teammates')
+    expect(await bandText($, false, 140)).not.toContain('Teammates')
   })
 
   test('a limit on pace to run out before its reset warns ahead of time', async ($, on) => {
@@ -803,7 +955,7 @@ describe('band layout', () => {
       rateLimits: [{ kind: 'five_hour', percentUsed: 47, resetsAt: new Date(START + 199 * 60_000).toISOString() }],
     })
 
-    expect(await bandText($, false, 140)).toContain('runs out in 1h53m at this pace')
+    expect(await bandText($, false, 140)).toContain('runs out in 1h 53m at this pace')
   })
 })
 
@@ -828,7 +980,8 @@ describe('tokens', () => {
     await step($, 'agent-1')
     await world.clock.settle()
 
-    expect(await bandText($, false, 140)).toContain('tokens 2k')
+    expect(await paneText($, 90)).toContain('2k   main 1k, agents 1k')
+    expect(await bandText($, false, 140)).not.toContain('2k')
   })
 
   test('a resumed session continues its saved count; /clear starts over', async ($, on) => {
@@ -837,11 +990,11 @@ describe('tokens', () => {
     boot(on, SESSION_ID, saved)
     await start($)
 
-    expect(await bandText($, false, 140)).toContain('tokens 1M')
+    expect(await paneText($, 90)).toContain('1M   main 1M, agents 0')
 
     await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
 
-    expect(await bandText($, false, 140)).toContain('tokens 0')
+    expect(await paneText($, 90)).not.toContain('Tokens')
   })
 
   test('switching to another session in the same process loads that session\'s count', async ($, on) => {
@@ -851,7 +1004,7 @@ describe('tokens', () => {
     await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
     await $.classic.SessionStart({ source: 'resume', session_id: 'session-2' })
 
-    expect(await bandText($, false, 140)).toContain('tokens 2M')
+    expect(await paneText($, 90)).toContain('2M   main 2M')
   })
 
   test('a session saved on the way out is found again when it comes back', async ($, on) => {
@@ -873,30 +1026,68 @@ describe('tokens', () => {
     await step($, undefined)
     await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
 
-    expect(await bandText($, false, 140)).toContain('tokens 0')
+    expect(await paneText($, 90)).not.toContain('Tokens')
 
     await $.classic.SessionStart({ source: 'resume', session_id: SESSION_ID })
 
-    expect(await bandText($, false, 140)).toContain('tokens 10')
+    expect(await paneText($, 90)).toContain('10   main 10, agents 0')
   })
 
   test('a store written by something else is ignored, not trusted', async ($, on) => {
     boot(on, SESSION_ID, { [`tokens:${SESSION_ID}`]: { tokens: 'lots' } })
     await start($)
 
-    expect(await bandText($, false, 140)).toContain('tokens 0')
+    expect(await paneText($, 90)).not.toContain('Tokens')
   })
 })
 
 describe('pane', () => {
-  test('/dash opens the pane and closes it again', async ($, on) => {
+  test('the pane opens with the session; /dash closes it and opens it again', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
 
     expect(world.openPanes).toEqual([PANE_ID])
 
     await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+
+    expect(world.openPanes).toEqual([])
+
+    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+
+    expect(world.openPanes).toEqual([PANE_ID])
+  })
+
+  test('a pane the person closed stays closed when the mod starts again in the same process', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await start($)
+
+    expect(world.openPanes).toEqual([])
+
+    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await start($)
+
+    expect(world.openPanes).toEqual([PANE_ID])
+  })
+
+  test('a run with nobody at the prompt opens no pane', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await $.session.start({ cwd: '/work', surface: null, isInteractive: false })
+
+    expect(world.openPanes).toEqual([])
+  })
+
+  test('/dash draws a pane the session opened undrawn, rather than closing it', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.undrawnPanes.add(PANE_ID)
+    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 90 } })
+
+    expect(world.openPanes).toEqual([PANE_ID])
+    expect(world.undrawnPanes.has(PANE_ID)).toBe(false)
+
+    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 90 } })
 
     expect(world.openPanes).toEqual([])
   })
@@ -907,20 +1098,36 @@ describe('pane', () => {
     const ui = await band($, 'terminal', false, 140, 5)
     await ui.press({ key: 'dash' })
 
+    expect(world.openPanes).toEqual([])
+
+    await ui.press({ key: 'dash' })
+
     expect(world.openPanes).toEqual([PANE_ID])
   })
 
-  test('the pane itemises usage, tokens and every worker', async ($, on) => {
+  test('the pane itemises usage, cost and every worker, and leaves out empty groups', async ($, on) => {
     const world = boot(on, SESSION_ID)
-    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'sh' } }))
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { ...DONE, backgroundTaskId: 'sh' } }))
     await start($)
     await measure($, world, MEASURED)
-    world.agents = [
-      { id: 'a1', description: 'list files', type: 'Explore', status: 'running' },
-      { id: 'a2', description: 'review', type: 'general-purpose', status: 'completed', parentId: 'a1' },
-    ]
+    world.agents = [EXPLORER, { id: 'a2', description: 'review', type: 'general-purpose', status: 'completed', parentId: 'a1' }]
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', description: 'Run tests', run_in_background: true })
     await world.clock.advance(1_000)
+
+    const expected = [
+      'Context',
+      '92k of 200k used',
+      '5-hour',
+      'Weekly',
+      'Cost',
+      '$3.41',
+      'Subagents  1 running, 1 done',
+      'Explore',
+      'list files',
+      'Background  1 running',
+      'shell',
+      'Run tests',
+    ]
 
     for (const surface of SURFACES) {
       for (const columns of [40, 90]) {
@@ -941,37 +1148,169 @@ describe('pane', () => {
 
         const text = (await ui.find({ type: 'Box' }))?.text ?? ''
 
-        for (const expected of ['Usage', 'Context', '5-hour', 'Weekly', 'Tokens', '$3.41', 'Explore', 'done 1', 'Run tests', 'Teammates none']) {
-          expect(text).toContain(expected)
+        for (const part of expected) {
+          expect(text).toContain(part)
         }
 
+        expect(text).not.toContain('Teammates')
+        expect(text).not.toContain('Tokens')
         await ui.unmount()
       }
     }
   })
 
-  test('a subagent\'s turn is not the main loop\'s', async ($, on) => {
+  test('the pane shows what a working subagent is doing and how full its context is', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    const reading = gate()
+
+    on('tool.call', async () => {
+      await reading.wait
+
+      return { result: DONE }
+    })
+    on('turn.step', async function* (_$, e) {
+      yield* []
+
+      return {
+        turnId: e.turnId,
+        index: e.index,
+        answer: '',
+        toolUses: [],
+        stopReason: 'end_turn',
+        usage: { input_tokens: 1_000, output_tokens: 500, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 7_000, model: e.model },
+      }
+    })
+    await start($)
+    world.agents = [EXPLORER]
+    await world.clock.advance(1_000)
+    await runStep($, { turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
+    const call = $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/w/model.ts', ...IN_AGENT })
+    await world.clock.settle()
+
+    expect(await paneText($, 90)).toContain('Haiku 5.5, low effort   reading model.ts   48k context')
+
+    reading.open()
+    await call
+    await world.clock.settle()
+    const after = await paneText($, 90)
+
+    expect(after).toContain('Haiku 5.5, low effort   48k context')
+    expect(after).not.toContain('reading model.ts')
+  })
+
+  test('the session\'s model comes from its main turn alone, and stays across /clear', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('turn.step', async function* (_$, e) {
+      yield* []
+
+      return {
+        turnId: e.turnId,
+        index: e.index,
+        answer: '',
+        toolUses: [],
+        stopReason: 'end_turn',
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          model: e.model === 'opus' ? 'claude-opus-5-5' : e.model,
+        },
+      }
+    })
+    await start($)
+
+    expect(await paneText($, 90)).not.toContain('Model')
+
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    await runStep($, { turnId: 'turn-1', index: 0, model: 'opus', effort: 'high', messageCount: 1 })
+
+    expect(await paneText($, 90)).toContain('Opus 5.5, high effort')
+
+    await runStep($, { turnId: 'turn-1', index: 1, model: 'opus', effort: 'high', messageCount: 3 })
+    await runStep($, { turnId: 'side-1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 })
+    await runStep($, { turnId: 'turn-a', index: 0, model: 'claude-haiku-5-5', effort: 'low', messageCount: 1, agentId: 'a1' })
+    const pane = await paneText($, 90)
+
+    expect(pane).toContain('Opus 5.5, high effort')
+    expect(pane).not.toContain('Haiku')
+
+    await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+
+    expect(await paneText($, 90)).toContain('Opus 5.5, high effort')
+  })
+
+  test('the context note counts the main conversation\'s compactions that ran, until /clear', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('session.compact', ($, e) => (e.instructions === 'blocked' ? { skip: 'a hook blocked it' } : { messages: SUMMARY }))
+    await start($)
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    await $.session.compact({ trigger: 'precompute', messages: SUMMARY })
+    await $.session.compact({ trigger: 'auto', messages: SUMMARY, agentId: 'a1' })
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY, instructions: 'blocked' })
+
+    expect(await paneText($, 90)).toContain('200k window, compacted once')
+
+    await $.session.compact({ trigger: 'auto', messages: SUMMARY })
+
+    expect(await paneText($, 90)).toContain('compacted twice')
+
+    await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+
+    expect(await paneText($, 90)).not.toContain('compacted')
+  })
+
+  test('the last reply\'s receipt survives an agent\'s turn', async ($, on) => {
     boot(on, SESSION_ID)
     await start($)
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
     await $.turn.complete({ answer: 'ok', durationMs: 1_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
     await $.turn.start({ text: 'look', turnId: 'turn-a', agentId: 'a1' })
-    const text = await paneText($, 90)
+    await $.turn.complete({ answer: 'x', durationMs: 2_000, isAborted: false, turnId: 'turn-a', reason: 'answer', agentId: 'a1' })
 
-    expect(text).not.toContain('Working')
-    expect(text).toContain('All done')
+    expect(await paneText($, 90)).toContain('just now, took 1s')
   })
 
   test('a failing agent list is shown, and the last list is kept', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    world.agents = [{ id: 'a1', description: 'list files', type: 'Explore', status: 'running' }]
+    world.agents = [EXPLORER]
     await world.clock.advance(1_000)
     world.isListBroken = true
     await world.clock.advance(1_000)
     const text = await bandText($, false, 140)
 
-    expect(text).toContain('⚠ refresh failed')
-    expect(text).toContain('Waiting on subagents')
+    expect(text).toContain('⚠ can\'t read agent list')
+    expect(text).toContain('Waiting on 1 subagent')
+    expect(await paneText($, 90)).toContain('⚠ Can\'t read the agent list: ')
+
+    // Too narrow for both: the title stays whole, the notice gives way.
+    const narrow = await bandText($, false, 40)
+
+    expect(narrow).toContain('Waiting on 1 subagent')
+    expect(narrow).not.toContain('can\'t read agent list')
+  })
+
+  test('a loop no list names and no spawn recorded leaves nothing behind', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    const reading = gate()
+
+    on('tool.call', async () => {
+      await reading.wait
+
+      return { result: DONE }
+    })
+    await start($)
+    const call = $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/w/model.ts', ...IN_AGENT })
+    await world.clock.settle()
+    world.agents = [EXPLORER]
+    await world.clock.advance(1_000)
+    const text = await paneText($, 90)
+
+    expect(text).toContain('list files')
+    expect(text).not.toContain('reading model.ts')
+
+    reading.open()
+    await call
   })
 })

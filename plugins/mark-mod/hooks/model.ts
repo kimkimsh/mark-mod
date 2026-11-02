@@ -3,6 +3,8 @@ import type {
   DashAgentModel,
   DashAgentModels,
   DashAgentStatus,
+  DashAgentWork,
+  DashAgentWorks,
   DashCall,
   DashCounts,
   DashLimit,
@@ -62,17 +64,9 @@ const PLAN_APPROVAL_TOOL = 'ExitPlanMode'
 
 const ASKING_TOOLS = new Set([QUESTION_TOOL, PLAN_APPROVAL_TOOL])
 
-const NO_READING = '—'
-
 const NOT_MEASURED = 'not measured yet'
 
-export const SUBAGENTS_LABEL = 'subagents'
-
-export const TEAMMATES_LABEL = 'teammates'
-
-export const BACKGROUND_LABEL = 'background'
-
-export const RUNNING_TEXT = 'running'
+const RUNNING_TEXT = 'running'
 
 const ACTIVE_AGENT_STATUSES = new Set<DashAgentStatus>(['pending', 'running', 'waiting'])
 
@@ -80,7 +74,21 @@ const MODEL_ID_PREFIX = 'claude-'
 
 const MODEL_FAMILY_PATTERN = /^[a-z]+$/
 
-const MODEL_TEXT_JOINER = '·'
+// A version is the one- or two-digit segments of an id (`opus-5-5`); a
+// date stamp (`20241022`) is longer and is not part of it.
+const MODEL_VERSION_PATTERN = /^\d{1,2}$/
+
+const MODEL_VERSION_JOINER = '.'
+
+// Bracketed suffixes (`[1m]`) name a context option, not the model.
+const MODEL_SUFFIX_PATTERN = /\[.*\]$/
+
+export const CLAUSE_JOINER = ', '
+
+const BUDGET_EFFORT_PATTERN = /^\d/
+
+// Vertex writes the date after an `@` (`claude-haiku-4-5@20251001`).
+const MODEL_SEGMENT_SEPARATOR = /[-@]/
 
 const TEAMMATE_TEAM_SEPARATOR = '@'
 
@@ -126,6 +134,9 @@ const FIVE_HOUR_LIMIT = 'five_hour'
 
 const SEVEN_DAY_LIMIT = 'seven_day'
 
+// A Claude gateway's own window.
+const SPEND_LIMIT = 'spend_limit'
+
 const LIMIT_WINDOW_MS = new Map([
   [FIVE_HOUR_LIMIT, 5 * 60 * 60 * 1000],
   [SEVEN_DAY_LIMIT, 7 * 24 * 60 * 60 * 1000],
@@ -142,6 +153,7 @@ const PACE_MIN_ELAPSED_MS = new Map([
 const LIMIT_LABELS = new Map([
   [FIVE_HOUR_LIMIT, '5-hour'],
   [SEVEN_DAY_LIMIT, 'Weekly'],
+  [SPEND_LIMIT, 'Spend limit'],
 ])
 
 export const BAND_LIMIT_KINDS = [FIVE_HOUR_LIMIT, SEVEN_DAY_LIMIT]
@@ -150,12 +162,17 @@ export type Severity = 'ok' | 'warn' | 'danger'
 
 export type Phase = 'needs-input' | 'working' | 'waiting' | 'done' | 'interrupted' | 'error' | 'ready'
 
-export type Headline = { phase: Phase; title: string; detail: string; elapsedText: string }
+// detail: clauses in order of importance; a narrow band drops them from the
+// end, whole, rather than cutting one mid-word.
+export type Headline = { phase: Phase; title: string; detail: string[] }
 
+// isMeasured: the gauge has a reading (or a passed reset) to show, rather
+// than "not measured yet".
 export type MeterView = {
   key: string
   label: string
   isAvailable: boolean
+  isMeasured: boolean
   leftPercent: number | null
   severity: Severity
   valueText: string
@@ -164,6 +181,9 @@ export type MeterView = {
 
 export type WorkerKind = 'subagent' | 'teammate' | 'task'
 
+// modelText is the form the band puts in parentheses ("haiku, low effort"),
+// modelFamily its shortest ("haiku"); modelDetailText the pane's
+// ("Haiku 5.5, low effort").
 export type WorkerView = {
   id: string
   kind: WorkerKind
@@ -175,9 +195,14 @@ export type WorkerView = {
   ageText: string
   isNested: boolean
   modelText: string
+  modelFamily: string
+  modelDetailText: string
+  activityText: string
+  contextText: string
 }
 
 export type TokenView = {
+  hasTokens: boolean
   totalText: string
   costText: string | null
   inputText: string
@@ -190,6 +215,8 @@ export type TokenView = {
 
 export type DashView = {
   headline: Headline
+  modelText: string | null
+  lastReplyText: string | null
   meters: MeterView[]
   limitsNote: string | null
   tokens: TokenView
@@ -215,6 +242,9 @@ export type DashSnapshot = {
   usage: DashUsage | null
   live: DashLive
   agentModels: DashAgentModels
+  agentWork: DashAgentWorks
+  mainModel: DashAgentModel | null
+  compactions: number
 }
 
 export type UsageCounts = {
@@ -388,6 +418,136 @@ export function isAskingTool(tool: string): boolean {
   return ASKING_TOOLS.has(tool)
 }
 
+// The arguments an activity is worded from; null where the call has none.
+export type ToolArgs = {
+  path: string | null
+  command: string | null
+  description: string | null
+  url: string | null
+  skill: string | null
+}
+
+// A path from a Windows session separates with `\`.
+const PATH_SEPARATOR_PATTERN = /[\\/]/
+
+// Userinfo before an `@` (`https://token@host/`) is skipped: it is not the
+// host, and it may be a credential the band would put on screen.
+const URL_HOST_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/(?:[^/?#@]*@)?([^/:?#@]+)/i
+
+const LINE_BREAK = '\n'
+
+// `mcp__<server>__<tool>`: the server is the part a person installed and knows.
+const MCP_TOOL_PATTERN = /^mcp__(.+?)__/
+
+// Stored activity text is kept short; rows clip it further to their width.
+const ACTIVITY_MAX_CELLS = 80
+
+// A command this short and plain says more than the model's description of it.
+const PLAIN_COMMAND_MAX_CELLS = 24
+
+const COMPOUND_COMMAND_PATTERN = /&&|\|\||[|;]/
+
+const TRAILING_STOP_PATTERN = /\.$/
+
+function baseName(path: string): string {
+  return path.split(PATH_SEPARATOR_PATTERN).pop() || path
+}
+
+function firstLine(text: string): string {
+  return text.trim().split(LINE_BREAK)[0] ?? ''
+}
+
+// "Run the tests" reads as "run the tests" after "Working"; an acronym
+// ("NPM install") keeps its capitals.
+function lowerFirst(text: string): string {
+  const second = text.charAt(1)
+
+  return second !== '' && second === second.toLowerCase() ? text.charAt(0).toLowerCase() + text.slice(1) : text
+}
+
+function commandActivity(args: ToolArgs): string {
+  const command = args.command === null ? '' : firstLine(args.command)
+  const description = args.description === null ? '' : firstLine(args.description).replace(TRAILING_STOP_PATTERN, '')
+  const isOneLine = args.command !== null && !args.command.trim().includes(LINE_BREAK)
+  const isPlain = isOneLine && command !== '' && cellWidth(command) <= PLAIN_COMMAND_MAX_CELLS && !COMPOUND_COMMAND_PATTERN.test(command)
+
+  if (isPlain || (description === '' && command !== '')) {
+    return `running ${command}`
+  }
+
+  return description === '' ? 'running a command' : lowerFirst(description)
+}
+
+const FIXED_ACTIVITIES = new Map([
+  ['WebSearch', 'searching the web'],
+  ['Agent', 'running a subagent'],
+  ['TodoWrite', 'updating the to-do list'],
+  ['TaskCreate', 'updating the to-do list'],
+  ['TaskUpdate', 'updating the to-do list'],
+  ['Monitor', 'starting a monitor'],
+  ['Workflow', 'starting a workflow'],
+  [QUESTION_TOOL, 'asking you a question'],
+  [PLAN_APPROVAL_TOOL, 'presenting a plan'],
+])
+
+const FILE_VERBS = new Map([
+  ['Read', 'reading'],
+  ['Edit', 'editing'],
+  ['NotebookEdit', 'editing'],
+  ['Write', 'writing'],
+])
+
+function wordedActivity(tool: string, args: ToolArgs): string {
+  const fixed = FIXED_ACTIVITIES.get(tool)
+
+  if (fixed !== undefined) {
+    return fixed
+  }
+
+  const fileVerb = FILE_VERBS.get(tool)
+
+  if (fileVerb !== undefined && args.path !== null) {
+    return `${fileVerb} ${baseName(args.path)}`
+  }
+
+  if (tool === 'Bash') {
+    return commandActivity(args)
+  }
+
+  const host = args.url === null ? undefined : URL_HOST_PATTERN.exec(args.url)?.[1]
+
+  if (tool === 'WebFetch' && host !== undefined) {
+    return `fetching ${host}`
+  }
+
+  if (tool === 'Skill' && args.skill !== null) {
+    return `using the ${args.skill} skill`
+  }
+
+  const server = MCP_TOOL_PATTERN.exec(tool)?.[1]
+
+  return `using ${server ?? tool}`
+}
+
+// What a tool call is doing, in the words a person would use.
+export function activityOf(tool: string, args: ToolArgs): string {
+  return clipCells(wordedActivity(tool, args), ACTIVITY_MAX_CELLS)
+}
+
+// "1 subagent", "3 subagents".
+function counted(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
+// "a", "a and b", "a, b and c".
+function joinedList(items: readonly string[]): string {
+  if (items.length <= 1) {
+    return items.join('')
+  }
+
+  return `${items.slice(0, -1).join(CLAUSE_JOINER)} and ${items[items.length - 1] ?? ''}`
+}
+
 // One prompt may carry several notifications when tasks end together.
 export function endedTaskIds(text: string): string[] {
   const ids: string[] = []
@@ -475,20 +635,90 @@ export function withRequest(models: DashAgentModels, id: string, model: string, 
   return withAgentEntry(models, id, { model: models[id]?.model ?? model, effort })
 }
 
-export function withoutAgentModels(models: DashAgentModels, ids: readonly string[]): DashAgentModels {
-  if (!ids.some(id => models[id] !== undefined)) {
-    return models
+// One entry per agent, by agent id (DashAgentModels, DashAgentWorks).
+type ByAgent<T> = Record<string, T>
+
+// Returns the record itself when none of the ids is in it, so a caller can
+// skip the write.
+export function withoutAgentEntries<T>(entries: ByAgent<T>, ids: readonly string[]) {
+  if (!ids.some(id => entries[id] !== undefined)) {
+    return entries
   }
 
-  const kept: DashAgentModels = {}
+  const kept: ByAgent<T> = {}
 
-  for (const [id, model] of Object.entries(models)) {
+  for (const [id, entry] of Object.entries(entries)) {
     if (!ids.includes(id)) {
-      kept[id] = model
+      kept[id] = entry
     }
   }
 
   return kept
+}
+
+function agentWorkOf(work: DashAgentWorks, id: string): DashAgentWork {
+  return work[id] ?? { activity: null, callId: null, contextTokens: null }
+}
+
+export function withAgentActivity(work: DashAgentWorks, id: string, callId: string, activity: string): DashAgentWorks {
+  return { ...work, [id]: { ...agentWorkOf(work, id), activity, callId } }
+}
+
+// Only the call that set the activity clears it: with calls in parallel, the
+// one that ends first must not wipe the one still running.
+export function withAgentCallEnded(work: DashAgentWorks, id: string, callId: string): DashAgentWorks {
+  const known = work[id]
+
+  return known === undefined || known.callId !== callId ? work : { ...work, [id]: { ...known, activity: null, callId: null } }
+}
+
+// The latest response's input side: how much the agent's context holds now.
+export function withAgentContext(work: DashAgentWorks, id: string, usage: UsageCounts): DashAgentWorks {
+  const known = agentWorkOf(work, id)
+  const contextTokens = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+
+  return known.contextTokens === contextTokens ? work : { ...work, [id]: { ...known, contextTokens } }
+}
+
+// The edit tools a reply receipt counts, by the argument that names the file.
+const EDIT_PATH_FIELDS = new Map([
+  ['Edit', 'file_path'],
+  ['Write', 'file_path'],
+  ['NotebookEdit', 'notebook_path'],
+])
+
+export function editPathField(tool: string): string | null {
+  return EDIT_PATH_FIELDS.get(tool) ?? null
+}
+
+export function newTurn(turnId: string, startedAt: number): DashTurn {
+  return { turnId, startedAt, calls: [], editedPaths: [], agentIds: [] }
+}
+
+// An edit counts toward the turn when the main loop made it or an agent the
+// turn started did; a background agent from an earlier turn is not this
+// reply's work.
+export function withEdit(turn: DashTurn | null, agentId: string | undefined, path: string): DashTurn | null {
+  if (turn === null || turn.editedPaths.includes(path)) {
+    return turn
+  }
+
+  const isTurnsOwn = agentId === undefined || turn.agentIds.includes(agentId)
+
+  return isTurnsOwn ? { ...turn, editedPaths: [...turn.editedPaths, path] } : turn
+}
+
+// An agent the main loop, or an agent of this turn, started. isReplyWork is
+// false for a teammate, which joins the session, and for a workflow's agent,
+// which works for a run in the background: neither is this reply's work.
+export function withSpawn(turn: DashTurn | null, agentId: string, parentAgentId: string | undefined, isReplyWork: boolean): DashTurn | null {
+  const isTurnsOwn = parentAgentId === undefined || turn?.agentIds.includes(parentAgentId) === true
+
+  if (turn === null || !isReplyWork || !isTurnsOwn || turn.agentIds.includes(agentId)) {
+    return turn
+  }
+
+  return { ...turn, agentIds: [...turn.agentIds, agentId] }
 }
 
 // A request's effort is a level or an integer budget.
@@ -505,29 +735,68 @@ export function effortLabel(effort: string | number | undefined): string | null 
 // provider's prefix or not (`claude-haiku-5-5`, `claude-3-5-sonnet-20241022`,
 // `us.anthropic.claude-opus-...`); anything else is shown as it is.
 export function modelFamily(model: string): string {
-  const start = model.indexOf(MODEL_ID_PREFIX)
+  const bare = model.replace(MODEL_SUFFIX_PATTERN, '')
+  const start = bare.indexOf(MODEL_ID_PREFIX)
 
   if (start < 0) {
-    return model
+    return bare
   }
 
-  const segments = model.slice(start + MODEL_ID_PREFIX.length).split('-')
+  const segments = bare.slice(start + MODEL_ID_PREFIX.length).split(MODEL_SEGMENT_SEPARATOR)
 
-  return segments.find(segment => MODEL_FAMILY_PATTERN.test(segment)) ?? model
+  return segments.find(segment => MODEL_FAMILY_PATTERN.test(segment)) ?? bare
 }
 
-function modelText(model: DashAgentModel | undefined): string {
+function capitalised(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+// The name a person knows a model by: family and version from its id
+// (`claude-opus-5-5` reads "Opus 5.5", `claude-3-5-sonnet-20241022`
+// "Sonnet 3.5"); an alias or a foreign id is shown as it is.
+export function modelName(model: string): string {
+  const bare = model.replace(MODEL_SUFFIX_PATTERN, '')
+  const start = bare.indexOf(MODEL_ID_PREFIX)
+
+  if (start < 0) {
+    return bare
+  }
+
+  const segments = bare.slice(start + MODEL_ID_PREFIX.length).split(MODEL_SEGMENT_SEPARATOR)
+  const family = segments.find(segment => MODEL_FAMILY_PATTERN.test(segment))
+
+  if (family === undefined) {
+    return bare
+  }
+
+  const version = segments.filter(segment => MODEL_VERSION_PATTERN.test(segment)).join(MODEL_VERSION_JOINER)
+
+  return version === '' ? capitalised(family) : `${capitalised(family)} ${version}`
+}
+
+// A level reads "low effort"; an integer budget ("16k") is thinking tokens.
+function effortText(effort: string): string {
+  return BUDGET_EFFORT_PATTERN.test(effort) ? `${effort} thinking budget` : `${effort} effort`
+}
+
+function shortModelText(model: DashAgentModel | undefined): string {
   if (model === undefined) {
     return ''
   }
 
-  const parts = [modelFamily(model.model)]
+  const family = modelFamily(model.model)
 
-  if (model.effort !== null) {
-    parts.push(model.effort)
+  return model.effort === null ? family : `${family}${CLAUSE_JOINER}${effortText(model.effort)}`
+}
+
+export function modelDetailText(model: DashAgentModel | null | undefined): string {
+  if (model === null || model === undefined) {
+    return ''
   }
 
-  return parts.join(MODEL_TEXT_JOINER)
+  const name = modelName(model.model)
+
+  return model.effort === null ? name : `${name}${CLAUSE_JOINER}${effortText(model.effort)}`
 }
 
 // background_tasks lists every loop's work in the session, agents' included,
@@ -578,7 +847,7 @@ function severityOf(usedPercent: number): Severity {
 
 const SEVERITY_RANK: Record<Severity, number> = { ok: 0, warn: 1, danger: 2 }
 
-function worseOf(a: Severity, b: Severity): Severity {
+export function worseOf(a: Severity, b: Severity): Severity {
   return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b
 }
 
@@ -687,7 +956,7 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / SECONDS_PER_MINUTE)
 
   if (minutes < SHORT_MINUTES_WITH_SECONDS) {
-    return `${minutes}m${twoDigits(seconds % SECONDS_PER_MINUTE)}s`
+    return `${minutes}m ${twoDigits(seconds % SECONDS_PER_MINUTE)}s`
   }
 
   if (minutes < MINUTES_PER_HOUR) {
@@ -697,10 +966,10 @@ export function formatDuration(ms: number): string {
   const hours = Math.floor(minutes / MINUTES_PER_HOUR)
 
   if (hours < HOURS_PER_DAY) {
-    return `${hours}h${twoDigits(minutes % MINUTES_PER_HOUR)}m`
+    return `${hours}h ${twoDigits(minutes % MINUTES_PER_HOUR)}m`
   }
 
-  return `${Math.floor(hours / HOURS_PER_DAY)}d${hours % HOURS_PER_DAY}h`
+  return `${Math.floor(hours / HOURS_PER_DAY)}d ${hours % HOURS_PER_DAY}h`
 }
 
 // The stored clock is coarse while idle, so seconds there would be invented.
@@ -714,31 +983,62 @@ function formatAgo(ms: number): string {
   return minutes < MINUTES_PER_HOUR ? `${minutes}m ago` : `${formatDuration(ms)} ago`
 }
 
-function contextMeter(usage: DashUsage | null): MeterView {
+const COMPACTION_TEXTS = ['', 'compacted once', 'compacted twice']
+
+function compactionText(compactions: number): string {
+  return COMPACTION_TEXTS[compactions] ?? `compacted ${compactions} times`
+}
+
+function contextNote(usage: DashUsage | null, compactions: number): string {
+  const parts: string[] = []
+
+  if (usage !== null) {
+    const windowText = formatTokens(usage.contextWindow)
+    parts.push(usage.contextTokens === null ? `${windowText} window` : `${formatTokens(usage.contextTokens)} of ${windowText} used`)
+  }
+
+  if (compactions > 0) {
+    parts.push(compactionText(compactions))
+  }
+
+  return parts.join(CLAUSE_JOINER)
+}
+
+function contextMeter(usage: DashUsage | null, compactions: number): MeterView {
   const usedPercent = usage?.contextPercent ?? null
-  const windowText = usage === null ? NO_READING : formatTokens(usage.contextWindow)
-  const tokensText = usage === null || usage.contextTokens === null ? NO_READING : formatTokens(usage.contextTokens)
   const leftPercent = usedPercent === null ? null : Math.max(0, PERCENT_FULL - usedPercent)
 
   return {
     key: CONTEXT_METER_KEY,
     label: 'Context',
     isAvailable: true,
+    isMeasured: leftPercent !== null,
     leftPercent,
     severity: usedPercent === null ? 'ok' : severityOf(usedPercent),
     valueText: leftPercent === null ? NOT_MEASURED : `${Math.floor(leftPercent)}% left`,
-    noteText: `${tokensText} / ${windowText}`,
+    noteText: contextNote(usage, compactions),
   }
 }
 
+const LIMIT_KIND_SEPARATOR = '_'
+
+const LABEL_WORD_SEPARATOR = ' '
+
+// A kind this mod has no name for reads as words: `seven_day_opus` is
+// "Seven day opus".
+function limitLabel(kind: string): string {
+  return LIMIT_LABELS.get(kind) ?? capitalised(kind.split(LIMIT_KIND_SEPARATOR).join(LABEL_WORD_SEPARATOR))
+}
+
 function limitMeter(kind: string, limit: DashLimit | undefined, now: number, hasResponse: boolean): MeterView {
-  const label = LIMIT_LABELS.get(kind) ?? kind
+  const label = limitLabel(kind)
 
   if (limit === undefined) {
     return {
       key: kind,
       label,
       isAvailable: !hasResponse,
+      isMeasured: false,
       leftPercent: null,
       severity: 'ok',
       valueText: hasResponse ? 'no data' : NOT_MEASURED,
@@ -753,6 +1053,7 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
       key: kind,
       label,
       isAvailable: true,
+      isMeasured: true,
       leftPercent: null,
       severity: 'ok',
       valueText: 'reset',
@@ -768,6 +1069,7 @@ function limitMeter(kind: string, limit: DashLimit | undefined, now: number, has
     key: kind,
     label,
     isAvailable: true,
+    isMeasured: true,
     leftPercent,
     severity: exhaustsIn === null ? severityOf(limit.percentUsed) : worseOf(severityOf(limit.percentUsed), 'warn'),
     valueText: `${Math.floor(leftPercent)}% left`,
@@ -798,9 +1100,9 @@ export function exhaustsBeforeReset(limit: DashLimit, now: number): number | nul
   return exhaustsIn < untilReset ? exhaustsIn : null
 }
 
-function meterViews(usage: DashUsage | null, now: number, hasResponse: boolean): MeterView[] {
+function meterViews(usage: DashUsage | null, now: number, hasResponse: boolean, compactions: number): MeterView[] {
   const limits = usage?.limits ?? []
-  const meters = [contextMeter(usage)]
+  const meters = [contextMeter(usage, compactions)]
   const kinds = [...BAND_LIMIT_KINDS]
 
   for (const limit of limits) {
@@ -824,12 +1126,14 @@ function limitsNoteOf(usage: DashUsage | null, hasResponse: boolean): string | n
   return hasResponse ? 'Responses carry no rate-limit data; expected when using an API key.' : null
 }
 
+// No cost before anything was spent: "$0.00" on a fresh session says nothing.
 function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
   const all = mergeCounts(tokens.main, tokens.agents)
 
   return {
+    hasTokens: sumCounts(all) > 0,
     totalText: formatTokens(sumCounts(all)),
-    costText: costUsd === null ? null : formatCost(costUsd),
+    costText: costUsd === null || costUsd <= 0 ? null : formatCost(costUsd),
     inputText: formatTokens(all.input),
     outputText: formatTokens(all.output),
     cacheReadText: formatTokens(all.cacheRead),
@@ -849,7 +1153,11 @@ const AGENT_STATUS_TEXT: Record<DashAgentStatus, string> = {
   killed: 'stopped',
 }
 
-function agentView(agent: DashAgent, now: number, models: DashAgentModels): WorkerView {
+function agentView(agent: DashAgent, now: number, models: DashAgentModels, work: DashAgentWorks): WorkerView {
+  const model = models[agent.id]
+  const done = work[agent.id]
+  const contextTokens = done?.contextTokens ?? null
+
   return {
     id: agent.id,
     kind: agent.isTeammate ? 'teammate' : 'subagent',
@@ -860,7 +1168,11 @@ function agentView(agent: DashAgent, now: number, models: DashAgentModels): Work
     statusText: AGENT_STATUS_TEXT[agent.status],
     ageText: formatDuration(now - agent.firstSeenAt),
     isNested: agent.isNested,
-    modelText: modelText(models[agent.id]),
+    modelText: shortModelText(model),
+    modelFamily: model === undefined ? '' : modelFamily(model.model),
+    modelDetailText: modelDetailText(model),
+    activityText: done?.activity ?? '',
+    contextText: contextTokens === null ? '' : `${formatTokens(contextTokens)} context`,
   }
 }
 
@@ -876,21 +1188,27 @@ function taskView(task: DashTask, now: number): WorkerView {
     ageText: formatDuration(now - task.startedAt),
     isNested: false,
     modelText: '',
+    modelFamily: '',
+    modelDetailText: '',
+    activityText: '',
+    contextText: '',
   }
 }
 
-function callsDetail(calls: readonly DashCall[]): string {
+// Between tools the model may be thinking or writing; the band cannot tell,
+// so it names nothing.
+function callsDetail(calls: readonly DashCall[]): string[] {
   const first = calls[0]
 
   if (first === undefined) {
-    return 'thinking'
+    return []
   }
 
-  return calls.length === 1 ? `${first.tool} ${RUNNING_TEXT}` : `${first.tool} +${calls.length - 1} ${RUNNING_TEXT}`
+  return calls.length === 1 ? [first.activity] : [`${first.activity} and ${calls.length - 1} more`]
 }
 
 const TURN_END_TITLES: Record<DashTurnEnd['reason'], { phase: Phase; title: string }> = {
-  answer: { phase: 'done', title: 'All done' },
+  answer: { phase: 'done', title: 'Done' },
   aborted: { phase: 'interrupted', title: 'Interrupted' },
   refusal: { phase: 'error', title: 'Refused' },
   error: { phase: 'error', title: 'Ended with an error' },
@@ -898,22 +1216,64 @@ const TURN_END_TITLES: Record<DashTurnEnd['reason'], { phase: Phase; title: stri
 
 type WorkerCounts = Pick<DashView, 'activeSubagents' | 'activeTeammates' | 'tasks'>
 
+// A task's kind as the engine's own footer counts it ("1 shell").
+const TASK_KIND_WORDS = new Map([
+  ['shell', { singular: 'shell', plural: 'shells' }],
+  ['monitor', { singular: 'monitor', plural: 'monitors' }],
+  ['workflow', { singular: 'workflow', plural: 'workflows' }],
+  ['remote', { singular: 'remote agent', plural: 'remote agents' }],
+])
+
 function waitingTitle(workers: WorkerCounts): string | null {
-  const groups = [
-    { name: SUBAGENTS_LABEL, count: workers.activeSubagents },
-    { name: TEAMMATES_LABEL, count: workers.activeTeammates },
-    { name: BACKGROUND_LABEL, count: workers.tasks.length },
-  ]
+  const groups: string[] = []
 
-  const names: string[] = []
+  if (workers.activeSubagents > 0) {
+    groups.push(counted(workers.activeSubagents, 'subagent', 'subagents'))
+  }
 
-  for (const group of groups) {
-    if (group.count > 0) {
-      names.push(group.name)
+  if (workers.activeTeammates > 0) {
+    groups.push(counted(workers.activeTeammates, 'teammate', 'teammates'))
+  }
+
+  for (const [kind, words] of TASK_KIND_WORDS) {
+    const count = workers.tasks.filter(task => task.label === kind).length
+
+    if (count > 0) {
+      groups.push(counted(count, words.singular, words.plural))
     }
   }
 
-  return names.length === 0 ? null : `Waiting on ${names.join(', ')}`
+  const other = workers.tasks.filter(task => !TASK_KIND_WORDS.has(task.label)).length
+
+  if (other > 0) {
+    groups.push(counted(other, 'background task', 'background tasks'))
+  }
+
+  return groups.length === 0 ? null : `Waiting on ${joinedList(groups)}`
+}
+
+// What the last main turn did, most telling first. The engine prints how long
+// it took right above the band, so the band leaves that to the pane.
+function turnEndWork(end: DashTurnEnd): string[] {
+  const parts: string[] = []
+
+  if (end.editedFiles > 0) {
+    parts.push(`edited ${counted(end.editedFiles, 'file', 'files')}`)
+  }
+
+  if (end.subagentsStarted > 0) {
+    parts.push(`used ${counted(end.subagentsStarted, 'subagent', 'subagents')}`)
+  }
+
+  return parts
+}
+
+function lastReplyText(end: DashTurnEnd | null, now: number): string | null {
+  if (end === null) {
+    return null
+  }
+
+  return [formatAgo(now - end.endedAt), `took ${formatDuration(end.durationMs)}`, ...turnEndWork(end)].join(CLAUSE_JOINER)
 }
 
 function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
@@ -923,44 +1283,28 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   if (ask !== undefined) {
     return {
       phase: 'needs-input',
-      title: 'Needs you',
-      detail: ask.tool === PLAN_APPROVAL_TOOL ? 'plan approval' : 'question',
-      elapsedText: formatDuration(now - ask.startedAt),
+      title: ask.tool === PLAN_APPROVAL_TOOL ? 'Needs your plan approval' : 'Needs your answer',
+      detail: [`waiting ${formatDuration(now - ask.startedAt)}`],
     }
   }
 
   if (snapshot.isWorking) {
-    return {
-      phase: 'working',
-      title: 'Working',
-      detail: callsDetail(snapshot.turn?.calls ?? []),
-      elapsedText: '',
-    }
+    return { phase: 'working', title: 'Working', detail: callsDetail(snapshot.turn?.calls ?? []) }
   }
 
   const waiting = waitingTitle(workers)
 
   if (waiting !== null) {
-    return {
-      phase: 'waiting',
-      title: waiting,
-      detail: '',
-      elapsedText: '',
-    }
+    return { phase: 'waiting', title: waiting, detail: [] }
   }
 
   if (snapshot.lastTurn === null) {
-    return { phase: 'ready', title: 'Ready', detail: '', elapsedText: '' }
+    return { phase: 'ready', title: 'Ready', detail: [] }
   }
 
   const end = TURN_END_TITLES[snapshot.lastTurn.reason]
 
-  return {
-    phase: end.phase,
-    title: end.title,
-    detail: `${formatAgo(now - snapshot.lastTurn.endedAt)} · took ${formatDuration(snapshot.lastTurn.durationMs)}`,
-    elapsedText: '',
-  }
+  return { phase: end.phase, title: end.title, detail: [formatAgo(now - snapshot.lastTurn.endedAt), ...turnEndWork(snapshot.lastTurn)] }
 }
 
 function activeFirst(a: WorkerView, b: WorkerView): number {
@@ -969,10 +1313,11 @@ function activeFirst(a: WorkerView, b: WorkerView): number {
 
 export function buildView(snapshot: DashSnapshot): DashView {
   const now = snapshot.live.now
-  const agents = snapshot.live.agents.map(agent => agentView(agent, now, snapshot.agentModels))
+  const agents = snapshot.live.agents.map(agent => agentView(agent, now, snapshot.agentModels, snapshot.agentWork))
   const subagents = agents.filter(agent => agent.kind === 'subagent').sort(activeFirst)
   const teammates = agents.filter(agent => agent.kind === 'teammate')
   const tasks = snapshot.tasks.map(task => taskView(task, now))
+  const mainModel = modelDetailText(snapshot.mainModel)
 
   const workers = {
     activeSubagents: subagents.filter(agent => agent.isActive).length,
@@ -982,7 +1327,9 @@ export function buildView(snapshot: DashSnapshot): DashView {
 
   return {
     headline: headlineOf(snapshot, workers),
-    meters: meterViews(snapshot.usage, now, snapshot.hasResponse),
+    modelText: mainModel === '' ? null : mainModel,
+    lastReplyText: lastReplyText(snapshot.lastTurn, now),
+    meters: meterViews(snapshot.usage, now, snapshot.hasResponse, snapshot.compactions),
     limitsNote: limitsNoteOf(snapshot.usage, snapshot.hasResponse),
     tokens: tokenView(snapshot.tokens, snapshot.usage?.costUsd ?? null),
     subagents,
