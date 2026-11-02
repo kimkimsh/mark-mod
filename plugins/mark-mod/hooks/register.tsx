@@ -1,11 +1,23 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
 
-import type { DashAgent, DashAgentModels, DashCall, DashCounts, DashTask, DashTokens, DashUsage } from '../types'
+import type {
+  DashAgent,
+  DashAgentModel,
+  DashAgentModels,
+  DashAgentWorks,
+  DashCall,
+  DashCounts,
+  DashTask,
+  DashTokens,
+  DashUsage,
+} from '../types'
 import {
+  activityOf,
   addTokens,
   agentsFromReading,
   buildView,
+  editPathField,
   effortLabel,
   emptyTokens,
   endedTaskIds,
@@ -14,23 +26,29 @@ import {
   isTaskOver,
   isTokensEmpty,
   livePaneIds,
+  newTurn,
   paneListingArgv,
   paneRosterFromText,
   rosterPath,
   tasksStillRead,
   usageFromReading,
+  withAgentActivity,
+  withAgentCallEnded,
+  withAgentContext,
   withAnsweredModel,
+  withEdit,
   withKnownLimits,
   withRequest,
+  withSpawn,
   withSpawnModel,
   withEndedPanes,
   withTask,
-  withoutAgentModels,
+  withoutAgentEntries,
   withoutConversation,
   withoutTask,
   withoutTasks,
 } from './model'
-import type { AgentReading, DashSnapshot, PaneRoster, TaskReading, UsageCounts, UsageReading } from './model'
+import type { AgentReading, DashSnapshot, PaneRoster, TaskReading, ToolArgs, UsageCounts, UsageReading } from './model'
 import { bandTree, paneTree } from './view'
 
 const PANE_ID = 'mark-mod'
@@ -61,9 +79,9 @@ const DEFAULT_CONFIG_DIR = '.claude'
 
 // Every $.state reference spells its plugin and key as literals: the
 // validator reads them from source and refuses a computed one.
-const turnAtom = atom({ plugin: 'mark-mod', key: 'turn' } as const, null)
+const turnAtom = atom({ plugin: 'mark-mod', key: 'mainTurn' } as const, null)
 
-const asksAtom = atom({ plugin: 'mark-mod', key: 'asks' } as const, [])
+const asksAtom = atom({ plugin: 'mark-mod', key: 'openAsks' } as const, [])
 
 const tasksAtom = atom({ plugin: 'mark-mod', key: 'tasks' } as const, [])
 
@@ -71,13 +89,24 @@ const tokensAtom = atom({ plugin: 'mark-mod', key: 'tokens' } as const, emptyTok
 
 const hasResponseAtom = atom({ plugin: 'mark-mod', key: 'hasResponse' } as const, false)
 
-const lastTurnAtom = atom({ plugin: 'mark-mod', key: 'lastTurn' } as const, null)
+const lastTurnAtom = atom({ plugin: 'mark-mod', key: 'lastReply' } as const, null)
 
 const usageAtom = atom({ plugin: 'mark-mod', key: 'usage' } as const, null)
 
 const liveAtom = atom({ plugin: 'mark-mod', key: 'live' } as const, { now: 0, agents: [], listError: null })
 
 const agentModelsAtom = atom({ plugin: 'mark-mod', key: 'agentModels' } as const, {})
+
+const agentWorkAtom = atom({ plugin: 'mark-mod', key: 'agentWork' } as const, {})
+
+const mainModelAtom = atom({ plugin: 'mark-mod', key: 'mainModel' } as const, null)
+
+const compactionsAtom = atom({ plugin: 'mark-mod', key: 'compactions' } as const, 0)
+
+// Set when the person closes the pane, by /dash or the pane's own close; a
+// later session.start (an enable, a worker respawn, a reload) then leaves it
+// closed. A fresh process starts it false, so a new session opens the pane.
+const paneClosedAtom = atom({ plugin: 'mark-mod', key: 'paneClosed' } as const, false)
 
 type SavedSession = { tokens: DashTokens; savedAt: number }
 
@@ -311,7 +340,8 @@ async function refreshLive($: EngineInterface): Promise<void> {
   if (listed !== null) {
     const listedIds = new Set(listed.map(agent => agent.id))
     const gone = previous.agents.filter(agent => !listedIds.has(agent.id)).map(agent => agent.id)
-    await changeAgentModels($, models => withoutAgentModels(models, gone))
+    await changeAgentModels($, models => withoutAgentEntries(models, gone))
+    await changeAgentWork($, work => withoutAgentEntries(work, gone))
   }
 
   const clock = (await isAnythingRunning($, agents)) ? now : now - (now % IDLE_CLOCK_STEP_MS)
@@ -354,29 +384,67 @@ function requestRefresh($: EngineInterface): void {
   })
 }
 
+// A tool's arguments ride beside the envelope's own keys; only a string is
+// worth wording an activity from.
+function stringArg(e: ToolCallInput, name: string | null): string | null {
+  const value: unknown = name === null ? undefined : Object.getOwnPropertyDescriptor(e, name)?.value
+
+  return value === String(value) ? String(value) : null
+}
+
+function toolArgs(e: ToolCallInput): ToolArgs {
+  return {
+    path: stringArg(e, editPathField(e.tool)) ?? stringArg(e, 'file_path'),
+    command: stringArg(e, 'command'),
+    description: stringArg(e, 'description'),
+    url: stringArg(e, 'url'),
+    skill: stringArg(e, 'skill'),
+  }
+}
+
 async function addCall($: EngineInterface, e: ToolCallInput): Promise<DashCall> {
-  const call: DashCall = { id: e.tool_use_id, tool: e.tool, startedAt: await $.clock.now() }
+  const call: DashCall = {
+    id: e.tool_use_id,
+    tool: e.tool,
+    startedAt: await $.clock.now(),
+    activity: activityOf(e.tool, toolArgs(e)),
+  }
 
   if (isAskingTool(e.tool)) {
     await update($, asksAtom, asks => [...asks, call])
   }
 
-  if (e.agentId === undefined) {
+  const { agentId } = e
+
+  if (agentId === undefined) {
     await update($, turnAtom, turn => (turn === null ? turn : { ...turn, calls: [...turn.calls, call] }))
+  } else if (await isTrackedAgent($, agentId)) {
+    await update($, agentWorkAtom, work => withAgentActivity(work, agentId, call.id, call.activity))
   }
 
   return call
 }
 
-async function removeCall($: EngineInterface, call: DashCall, isMainLoop: boolean): Promise<void> {
+// An edit that went through: the reply's receipt counts the files it changed.
+async function recordEdit($: EngineInterface, e: ToolCallInput): Promise<void> {
+  const path = stringArg(e, editPathField(e.tool))
+
+  if (path !== null) {
+    await update($, turnAtom, turn => withEdit(turn, e.agentId, path))
+  }
+}
+
+async function removeCall($: EngineInterface, call: DashCall, agentId: string | undefined): Promise<void> {
   if (isAskingTool(call.tool)) {
     await update($, asksAtom, asks => asks.filter(ask => ask.id !== call.id))
   }
 
-  if (isMainLoop) {
+  if (agentId === undefined) {
     await update($, turnAtom, turn =>
       turn === null ? turn : { ...turn, calls: turn.calls.filter(one => one.id !== call.id) },
     )
+  } else {
+    await changeAgentWork($, work => withAgentCallEnded(work, agentId, call.id))
   }
 }
 
@@ -406,12 +474,47 @@ async function addStepUsage($: EngineInterface, usage: UsageCounts, isMainLoop: 
   }
 }
 
-// turn.step runs once per request, so the map is written only when it changes.
+// tool.call and turn.step run per call and per request; a change that leaves
+// the record as it is skips the write. One function per atom: the engine's
+// module scan accepts only an atom named at the read or update itself.
 async function changeAgentModels($: EngineInterface, change: (models: DashAgentModels) => DashAgentModels): Promise<void> {
   const models = await read($, agentModelsAtom)
 
   if (change(models) !== models) {
     await update($, agentModelsAtom, change)
+  }
+}
+
+async function changeAgentWork($: EngineInterface, change: (work: DashAgentWorks) => DashAgentWorks): Promise<void> {
+  const work = await read($, agentWorkAtom)
+
+  if (change(work) !== work) {
+    await update($, agentWorkAtom, change)
+  }
+}
+
+// An agent the list names, or one a spawn recorded that it will name. A
+// workflow's agents and the engine's forks (compaction, memory) carry ids no
+// list names: an entry for one would never be taken down, so none is made.
+async function isTrackedAgent($: EngineInterface, agentId: string): Promise<boolean> {
+  if ((await read($, agentModelsAtom))[agentId] !== undefined) {
+    return true
+  }
+
+  return (await read($, liveAtom)).agents.some(agent => agent.id === agentId)
+}
+
+// Only a step of the main turn on record names the session's model: a side
+// request the engine makes on the main loop could run on another one.
+async function isMainTurnStep($: EngineInterface, turnId: string): Promise<boolean> {
+  return (await read($, turnAtom))?.turnId === turnId
+}
+
+async function changeMainModel($: EngineInterface, next: DashAgentModel): Promise<void> {
+  const known = await read($, mainModelAtom)
+
+  if (known === null || known.model !== next.model || known.effort !== next.effort) {
+    await update($, mainModelAtom, () => next)
   }
 }
 
@@ -427,37 +530,58 @@ async function reconcileTasks($: EngineInterface, readings: readonly TaskReading
 // What the turn record says; the band replaces isWorking with the engine's
 // own AbovePrompt prop.
 async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
-  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels] = await Promise.all([
-    read($, turnAtom),
-    read($, asksAtom),
-    read($, tasksAtom),
-    read($, tokensAtom),
-    read($, hasResponseAtom),
-    read($, lastTurnAtom),
-    read($, usageAtom),
-    read($, liveAtom),
-    read($, agentModelsAtom),
-  ])
+  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels, agentWork, mainModel, compactions] =
+    await Promise.all([
+      read($, turnAtom),
+      read($, asksAtom),
+      read($, tasksAtom),
+      read($, tokensAtom),
+      read($, hasResponseAtom),
+      read($, lastTurnAtom),
+      read($, usageAtom),
+      read($, liveAtom),
+      read($, agentModelsAtom),
+      read($, agentWorkAtom),
+      read($, mainModelAtom),
+      read($, compactionsAtom),
+    ])
 
-  return { isWorking: turn !== null, turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels }
+  return {
+    isWorking: turn !== null,
+    turn,
+    asks,
+    tasks,
+    tokens,
+    hasResponse,
+    lastTurn,
+    usage,
+    live,
+    agentModels,
+    agentWork,
+    mainModel,
+    compactions,
+  }
 }
 
+// A pane opened unasked on a narrow terminal is open but undrawn; to the
+// person it is closed, so /dash draws it rather than closing it.
 async function togglePane($: EngineInterface): Promise<string | null> {
   const panes = await $.ui.panes()
 
-  if (panes.some(pane => pane.id === PANE_ID)) {
+  if (panes.some(pane => pane.id === PANE_ID && pane.isPlaced)) {
     await $.ui.close({ id: PANE_ID })
 
     return null
   }
 
   const opened = await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
+  await update($, paneClosedAtom, () => false)
 
   return opened.isPlaced ? null : opened.reason
 }
 
-// Rate-limit windows are the account's and stay; everything that belongs to
-// the conversation starts over.
+// Rate-limit windows are the account's and stay, and so does the model the
+// session runs on; everything that belongs to the conversation starts over.
 async function resetConversation($: EngineInterface): Promise<void> {
   await update($, tokensAtom, () => emptyTokens())
   await update($, turnAtom, () => null)
@@ -465,6 +589,8 @@ async function resetConversation($: EngineInterface): Promise<void> {
   await update($, lastTurnAtom, () => null)
   await update($, hasResponseAtom, () => false)
   await update($, agentModelsAtom, () => ({}))
+  await update($, agentWorkAtom, () => ({}))
+  await update($, compactionsAtom, () => 0)
   await update($, usageAtom, usage => (usage === null ? usage : withoutConversation(usage)))
 }
 
@@ -476,6 +602,14 @@ export const register: Register = on => {
       requestRefresh($)
     })
     await seedTokens($, await $.session.id())
+
+    // Open from the start for a person at the prompt, unless they closed it
+    // earlier in this process. This open is unasked, so on a terminal too
+    // narrow for one the engine holds the pane undrawn until /dash or a wider
+    // window.
+    if (e.isInteractive && !(await read($, paneClosedAtom))) {
+      await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
+    }
 
     return next(e)
   })
@@ -511,7 +645,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       const startedAt = await $.clock.now()
-      await update($, turnAtom, () => ({ turnId: e.turnId, startedAt, calls: [] }))
+      await update($, turnAtom, () => newTurn(e.turnId, startedAt))
     }
 
     requestRefresh($)
@@ -522,22 +656,34 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     const { agentId } = e
 
+    const effort = effortLabel(e.effort)
+    const isMainStep = agentId === undefined && (await isMainTurnStep($, e.turnId))
+
     // Recorded as the request starts, so a long first step already shows it.
-    if (agentId !== undefined) {
-      await changeAgentModels($, models => withRequest(models, agentId, e.model, effortLabel(e.effort)))
+    if (isMainStep) {
+      await changeMainModel($, { model: (await read($, mainModelAtom))?.model ?? e.model, effort })
+    } else if (agentId !== undefined && (await isTrackedAgent($, agentId))) {
+      await changeAgentModels($, models => withRequest(models, agentId, e.model, effort))
     }
 
     const step = yield* next(e)
+    const { usage } = step
 
-    if (step.usage !== null) {
-      await addStepUsage($, step.usage, agentId === undefined)
+    if (usage === null) {
+      return step
     }
+
+    await addStepUsage($, usage, agentId === undefined)
 
     // A hook beneath this one may have sent another model than e.model; the
     // response names the one that answered. Effort has no such answer.
-    if (agentId !== undefined && step.usage !== null) {
-      const answered = step.usage.model
-      await changeAgentModels($, models => withAnsweredModel(models, agentId, answered))
+    if (isMainStep) {
+      await changeMainModel($, { model: usage.model, effort })
+    } else if (agentId !== undefined && (await isTrackedAgent($, agentId))) {
+      // Asked again: an agent's first request can start before its spawn is
+      // recorded.
+      await changeAgentModels($, models => withAnsweredModel(models, agentId, usage.model))
+      await changeAgentWork($, work => withAgentContext(work, agentId, usage))
     }
 
     return step
@@ -548,8 +694,10 @@ export const register: Register = on => {
 
     const { agentId, model } = started
 
-    if (agentId !== undefined) {
+    // A workflow's agent never enters the list, so nothing is kept for it.
+    if (agentId !== undefined && e.workflow === undefined) {
       await changeAgentModels($, models => withSpawnModel(models, agentId, model))
+      await update($, turnAtom, turn => withSpawn(turn, agentId, e.parentAgentId, started.teammateId === undefined))
     }
 
     return started
@@ -558,9 +706,16 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       const endedAt = await $.clock.now()
+      const turn = await read($, turnAtom)
       await update($, turnAtom, () => null)
       await update($, asksAtom, () => [])
-      await update($, lastTurnAtom, () => ({ reason: e.reason, endedAt, durationMs: e.durationMs }))
+      await update($, lastTurnAtom, () => ({
+        reason: e.reason,
+        endedAt,
+        durationMs: e.durationMs,
+        editedFiles: turn?.editedPaths.length ?? 0,
+        subagentsStarted: turn?.agentIds.length ?? 0,
+      }))
     }
 
     void queueSave($, await $.session.id())
@@ -573,9 +728,15 @@ export const register: Register = on => {
     const call = await addCall($, e)
 
     try {
-      return await next(e)
+      const ran = await next(e)
+
+      if (isAnswered(ran)) {
+        await recordEdit($, e)
+      }
+
+      return ran
     } finally {
-      await removeCall($, call, e.agentId === undefined)
+      await removeCall($, call, e.agentId)
     }
   })
 
@@ -683,6 +844,32 @@ export const register: Register = on => {
     requestRefresh($)
 
     return next(e)
+  })
+
+  // Counted only once it ran: a skipped compaction leaves the conversation as
+  // it was, and a precompute installs nothing. Where an organization manages
+  // Claude Code this hook is not delivered, so the count stays at zero and
+  // shows nothing rather than a false "never".
+  on('session.compact', async ($, e, next) => {
+    const compacted = await next(e)
+
+    if (e.agentId === undefined && e.trigger !== 'precompute' && compacted.messages !== undefined) {
+      await update($, compactionsAtom, count => count + 1)
+    }
+
+    return compacted
+  })
+
+  // Every close but an unload, which never reaches the opener's hooks: the
+  // person's close mark or key, and /dash's own $.ui.close.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+
+    if (e.id === PANE_ID) {
+      await update($, paneClosedAtom, () => true)
+    }
+
+    return closed
   })
 
   on('command.run', { command: COMMAND }, async $ => {
