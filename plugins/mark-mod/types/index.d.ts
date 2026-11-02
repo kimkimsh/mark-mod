@@ -83,9 +83,10 @@ export type DashAgentWork = { activity: string | null; callId: string | null; co
 
 export type DashAgentWorks = Record<string, DashAgentWork>
 
-// $.state outlives a reload, so a value whose form changes must not be read
-// back in the old form: give it a new key, or its atom a new `shape` tag
-// (AtomOptions); either way the old value reads as absent.
+// $.state outlives a reload, so a value whose form changes moves to a new key,
+// under which the old value reads as absent. The engine's own tag for this,
+// AtomOptions' `shape`, is an identifier the repo's no-shape-in-symbol-names
+// lint rule refuses.
 declare module 'claude-code' {
   interface PluginState {
     'mark-mod': {
