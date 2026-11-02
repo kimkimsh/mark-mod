@@ -226,10 +226,11 @@ Each request is counted once; `turn.complete` totals are never added.
 ## Persistence
 
 `$.state` survives a hot reload, so newer code can find a value an older
-version wrote. A value whose form changes must not be read back in the old
-form: it takes a new key (as `mainTurn`, `openAsks` and `lastReply` did) or
-its atom a new `shape` tag (`AtomOptions`), and either way the new code reads
-its initial value instead of misreading the old one.
+version wrote. A value whose form changes therefore moves to a new key (as
+`mainTurn`, `openAsks` and `lastReply` did), under which the new code reads its
+initial value instead of misreading the old one. The engine's own tag for
+this, `AtomOptions`' `shape`, is not used: the repository's
+`no-shape-in-symbol-names` lint rule refuses the identifier.
 
 Token totals are also written to `$.store`, one key per session
 (`tokens:<id>`, since concurrent Claude processes share the store), at every
