@@ -255,18 +255,31 @@ Limits, all the engine's:
   a toast says one is waiting. A run once queued cannot be withdrawn: a tab
   click made while it waits is undone when it runs.
 - With the `Diff` tab open behind the session pane, `/diff` from the band or
-  the pane closes it, as typed `/diff` does; a second press opens it in front.
-  Only a "show" call for another plugin's pane would fix this; the result's
-  text ("Diff panel hidden") could be matched to run it again, but that is the
-  engine's prose, not a contract.
-- An open is "asked" only with the person's command, prompt or press behind
-  it, and a press that goes through `$.command.run` reaches the diff plugin
-  as a plugin's command, so the `Diff` pane it opens is unasked: placed from
-  144 columns, or 110 once the person has opened it. Below 144 the first
-  button press is refused, and the diff plugin answers with its own
-  "Resize your terminal to at least 110 columns" text (seen live at 140
-  columns on 2.1.317); a typed `/diff` lowers the floor to 110 and the
-  buttons work after it. Closing needs no seat and works at any width.
+  the pane closes it, as typed `/diff` does; the hand-over below then offers
+  the person a `/diff` that opens it in front. Only a "show" call for another
+  plugin's pane would make one press do it.
+- An open is "asked" only when its origin chain is one hop from the person:
+  their command or prompt, or a `ui.press`, `ui.input` or `ui.select` the
+  opening plugin itself handled (the engine's `$D` in 2.1.317). A press that
+  goes through `$.command.run` reaches the diff plugin as this plugin's
+  command, two hops, so the `Diff` pane it opens is unasked: placed from 144
+  columns, or 110 once the person has opened it (kept in `~/.claude.json`
+  `pluginPanes.asked`, dropped when the person closes the pane with its close
+  mark or Esc). Below the floor the diff plugin answers its own "Resize your
+  terminal to at least 110 columns" text. Closing needs no seat.
+
+The hand-over: a press with the session idle reads whether the session pane
+is in front, runs `/diff`, and reads it again. A shown panel puts its `Diff`
+tab in front; a pane still in front after a run that answered text means the
+panel did not come up (refused, or a hidden `Diff` tab closed). Then
+`$.prompt.fill` puts `/diff` in the prompt box and a toast says to press
+Enter; the person's own `/diff` is asked, at any width from 110, and the
+engine records it, so later presses work in one. A draft in the box is never
+replaced: the toast asks the person to type `/diff` instead. A press during a
+turn is not checked, since its run starts after the person may have switched
+tabs. Under the older sidebar the covered pane still reads shown, but the
+sidebar's `/diff` answers no text, so it is never taken for a failure. The
+check is the pane's state, not the answer's wording.
 - Under the sidebar shape, `/dash` cannot see the sidebar covering the pane,
   so it closes the hidden pane rather than raising it.
 

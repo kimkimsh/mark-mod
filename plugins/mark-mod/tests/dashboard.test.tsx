@@ -36,12 +36,29 @@ type World = {
   closeError: string | null
   diffRuns: number
   diffError: string | null
+  // What the engine's /diff does, as the session pane sees it.
+  diffOutcome: DiffOutcome
+  // The person's prompt box.
+  draft: string
   toasts: string[]
   env: Map<string, string>
 }
 
 
 type StoredEntries = Parameters<typeof mock.store>[1]
+
+// shown: the Diff tab comes in front of the session pane. hidden: a Diff tab
+// in front closes and the session pane is in front again. refused: an unasked
+// open below 144 columns, nothing moves. silent: the older sidebar, which
+// covers the pane, leaves it reading shown and answers no text.
+type DiffOutcome = 'shown' | 'hidden' | 'refused' | 'silent'
+
+const DIFF_ANSWERS = {
+  shown: { text: 'Diff panel shown' },
+  hidden: { text: 'Diff panel hidden' },
+  refused: { text: 'Resize your terminal to at least 110 columns to show the diff panel' },
+  silent: {},
+} as const
 
 function boot(on: On, sessionId: string, stored?: StoredEntries): World {
   const world: World = {
@@ -58,6 +75,8 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
     closeError: null,
     diffRuns: 0,
     diffError: null,
+    diffOutcome: 'shown',
+    draft: '',
     toasts: [],
     env: new Map(),
   }
@@ -118,7 +137,21 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
 
     world.diffRuns += 1
 
-    return {}
+    if (world.diffOutcome === 'shown' && world.openPanes.includes(PANE_ID)) {
+      world.behindPanes.add(PANE_ID)
+    }
+
+    if (world.diffOutcome === 'hidden') {
+      world.behindPanes.delete(PANE_ID)
+    }
+
+    return DIFF_ANSWERS[world.diffOutcome]
+  })
+  on('prompt.read', () => ({ value: { text: world.draft, cursor: world.draft.length } }))
+  on('prompt.fill', ($, e) => {
+    world.draft = e.text
+
+    return { isFilled: true }
   })
   on('ui.toast', ($, e) => {
     world.toasts.push(e.text)
@@ -1515,6 +1548,64 @@ describe('changes panel', () => {
     const ui = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
     await ui.press({ key: 'diff' })
 
+    expect(world.toasts).toEqual(['/diff runs once Claude finishes this turn'])
+  })
+
+  test('a run that leaves the session pane in front puts /diff in the prompt box to send', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.diffOutcome = 'refused'
+    await start($)
+    const ui = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
+    await ui.press({ key: 'diff' })
+
+    expect(world.draft).toBe('/diff')
+    expect(world.toasts).toEqual(['The changes panel did not come up from the button; press Enter to send /diff yourself'])
+  })
+
+  test('a draft in the prompt box is kept, and the person is asked to type /diff', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.diffOutcome = 'refused'
+    world.draft = 'fix the band'
+    await start($)
+    const ui = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
+    await ui.press({ key: 'diff' })
+
+    expect(world.draft).toBe('fix the band')
+    expect(world.toasts).toEqual(['The changes panel did not come up from the button; type /diff yourself'])
+  })
+
+  test('a changes panel that comes up, or a way back to the pane, leaves the prompt box alone', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'diff' })
+    world.diffOutcome = 'hidden'
+    await ui.press({ key: 'diff' })
+
+    expect(world.diffRuns).toBe(2)
+    expect(world.draft).toBe('')
+    expect(world.toasts).toEqual([])
+  })
+
+  test('the older sidebar, which answers no text, leaves the prompt box alone', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.diffOutcome = 'silent'
+    await start($)
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'diff' })
+
+    expect(world.draft).toBe('')
+  })
+
+  test('a press during a turn hands nothing to the prompt box', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.diffOutcome = 'refused'
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    const ui = await band($, 'terminal', true, 140, 5)
+    await ui.press({ key: 'diff' })
+
+    expect(world.draft).toBe('')
     expect(world.toasts).toEqual(['/diff runs once Claude finishes this turn'])
   })
 
