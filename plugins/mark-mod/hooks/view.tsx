@@ -37,9 +37,10 @@ const WARNING_MARK = '⚠ '
 
 const LIST_ERROR_TEXT = "can't read agent list"
 
-const DASH_LABEL = '/dash'
+const BAND_DASH_MIN_CELLS = 80
 
-const BAND_BUTTON_MIN_CELLS = 80
+// Before each item at a row's right end: after the row's text, then between items.
+const RIGHT_ITEM_GAP_CELLS = 1
 
 const BAND_COST_MIN_CELLS = 56
 
@@ -331,7 +332,16 @@ function headlineCells(view: DashView): number {
 
 type RightItem = { key: string; text: string; element: RenderElement }
 
-function rightItems(kit: Kit, view: DashView, cells: number, maxRows: number, trailing: RenderElement): RightItem[] {
+// A button the register draws, since it owns the press; the view only places
+// it and counts its label's cells.
+export type BandButton = RightItem
+
+// The band stays drawn while the changes panel covers the pane or hides it
+// behind a tab, so its /diff is the way back and is kept at any width it fits;
+// /dash gives way on a narrow band.
+export type BandButtons = { diff: BandButton; dash: BandButton }
+
+function rightItems(kit: Kit, view: DashView, cells: number, maxRows: number, buttons: BandButtons): RightItem[] {
   const { Text } = kit
   const items: RightItem[] = []
   const alert = maxRows < BAND_ROWS_TWO ? alertMeter(view) : null
@@ -351,16 +361,18 @@ function rightItems(kit: Kit, view: DashView, cells: number, maxRows: number, tr
     items.push({ key: 'cost', text, element: <Text key="cost" dimColor>{text}</Text> })
   }
 
-  if (cells >= BAND_BUTTON_MIN_CELLS) {
-    items.push({ key: 'dash', text: DASH_LABEL, element: trailing })
+  items.push(buttons.diff)
+
+  if (cells >= BAND_DASH_MIN_CELLS) {
+    items.push(buttons.dash)
   }
 
   return items
 }
 
-// One cell before each item: the group's left padding, then the gaps.
+// One gap before each item: the group's left padding, then the gaps.
 function itemsCells(items: readonly RightItem[]): number {
-  let cells = items.length
+  let cells = items.length * RIGHT_ITEM_GAP_CELLS
 
   for (const item of items) {
     cells += cellWidth(item.text)
@@ -369,8 +381,8 @@ function itemsCells(items: readonly RightItem[]): number {
   return cells
 }
 
-// The title is never cut: right-hand items give way from the end (the
-// button, then the cost) while title and items overrun the row.
+// The title is never cut: right-hand items give way from the end (/dash,
+// /diff, then the cost) while title and items overrun the row.
 function fittedItems(items: readonly RightItem[], cells: number): RightItem[] {
   const kept = [...items]
 
@@ -513,11 +525,11 @@ export function bandTree(
   view: DashView,
   columns: number,
   maxRows: number,
-  trailing: RenderElement,
+  buttons: BandButtons,
 ): RenderElement {
   const { Box } = kit
   const cells = columns - BAND_INDENT
-  const right = fittedItems(rightItems(kit, view, cells, maxRows, trailing), cells - headlineCells(view))
+  const right = fittedItems(rightItems(kit, view, cells, maxRows, buttons), cells - headlineCells(view))
   const detailBudget = cells - headlineCells(view) - itemsCells(right)
 
   return (
@@ -525,7 +537,7 @@ export function bandTree(
       <Box flexDirection="row" justifyContent="space-between">
         <Box flexShrink={1}>{headlineText(kit, view, detailBudget)}</Box>
         {right.length === 0 ? null : (
-          <Box flexDirection="row" flexShrink={0} gap={1} paddingLeft={1}>
+          <Box flexDirection="row" flexShrink={0} gap={RIGHT_ITEM_GAP_CELLS} paddingLeft={RIGHT_ITEM_GAP_CELLS}>
             {right.map(item => item.element)}
           </Box>
         )}
@@ -629,19 +641,26 @@ function paneRow(kit: Kit, labelColumns: number, key: string, label: string, val
 
 // The state in the band's words; the detail only while it says what is
 // happening now, since a resting state's history is the Last reply row.
-function sessionCard(kit: Kit, view: DashView, labelColumns: number): Card {
-  const { Text } = kit
+function sessionCard(kit: Kit, view: DashView, labelColumns: number, button: RenderElement): Card {
+  const { Box, Text } = kit
   const { phase, title, detail } = view.headline
   const style = PHASE_STYLE[phase]
   const isLive = LIVE_PHASES.has(phase)
 
   const body = [
-    <Text key="state" wrap="truncate-end">
-      <Text color={style.color} bold>
-        {style.glyph} {title}
-      </Text>
-      {isLive && detail.length > 0 ? HEADLINE_GAP + detail.join(CLAUSE_JOINER) : ''}
-    </Text>,
+    <Box key="state" flexDirection="row" justifyContent="space-between">
+      <Box flexShrink={1}>
+        <Text wrap="truncate-end">
+          <Text color={style.color} bold>
+            {style.glyph} {title}
+          </Text>
+          {isLive && detail.length > 0 ? HEADLINE_GAP + detail.join(CLAUSE_JOINER) : ''}
+        </Text>
+      </Box>
+      <Box flexShrink={0} paddingLeft={RIGHT_ITEM_GAP_CELLS}>
+        {button}
+      </Box>
+    </Box>,
   ]
 
   if (view.modelText !== null) {
@@ -957,7 +976,8 @@ function logRowsFor(frame: PaneFrame, rowsAbove: number): number {
   return Math.max(LOG_MIN_ROWS, frame.bodyRows - rowsAbove - LOG_HEADER_ROWS - CARD_FRAME_ROWS)
 }
 
-export function paneTree(kit: Kit, view: DashView, log: PaneLog, frame: PaneFrame): PaneDrawing {
+// stateButton: drawn at the right end of the State card's first row.
+export function paneTree(kit: Kit, view: DashView, log: PaneLog, frame: PaneFrame, stateButton: RenderElement): PaneDrawing {
   const { Box, Text } = kit
   const cells = frame.columns >= PANE_COLUMNS_WIDE ? PANE_BAR_CELLS_WIDE : PANE_BAR_CELLS_NARROW
   const labelColumns = paneLabelColumns(view)
@@ -969,7 +989,7 @@ export function paneTree(kit: Kit, view: DashView, log: PaneLog, frame: PaneFram
       </Text>
     )
 
-  const cards = [sessionCard(kit, view, labelColumns), usageCard(kit, view, labelColumns, cells), agentsCard(kit, view)].filter(
+  const cards = [sessionCard(kit, view, labelColumns, stateButton), usageCard(kit, view, labelColumns, cells), agentsCard(kit, view)].filter(
     (one): one is Card => one !== null,
   )
 

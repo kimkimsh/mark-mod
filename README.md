@@ -5,7 +5,7 @@ A Claude Code mod that shows what your session is doing while you work: a short 
 This README is for a Claude Code user who wants to install the mod and read what it shows. Developers changing the mod should also read [Development](#development) and [docs/design.md](docs/design.md).
 
 ```
-  ● Working  editing view.tsx                                                                          $0.19 /dash
+  ● Working  editing view.tsx                                                                    $0.19 /diff /dash
   Context ███████░ 88% left   5-hour ████▌░░░ 45% left, runs out in 1h 35m at this pace   Weekly ███████▋ 96% left, resets in 6d 17h
   Subagents   Find callers of buildView (haiku, low effort) 40s     Background   npm test 20s
 ```
@@ -43,7 +43,8 @@ There is nothing to start. Once the mod is installed:
 
 - **The band** is drawn above the prompt in every session.
 - **The dashboard pane** opens by itself when a session starts. In fullscreen mode it docks beside the conversation; otherwise it sits above the prompt.
-- **Close or reopen the pane:** type `/dash`, or click `/dash` at the right end of the band. Each use switches it. A pane you closed stays closed until you open it again, even when the mod reloads; a new Claude Code session opens it again.
+- **Close or reopen the pane:** type `/dash`, or click `/dash` at the right end of the band. Each use switches it. If the pane is hidden behind another pane's tab (Claude Code's changes panel, say), `/dash` brings it to the front instead of closing it. A pane you closed stays closed until you open it again, even when the mod reloads; a new Claude Code session opens it again.
+- **See what Claude changed, and come back:** see [Switching to the changes panel](#switching-to-the-changes-panel).
 - **Narrow terminal:** a pane nobody asked for needs room, so on a narrow terminal Claude Code keeps the session's pane back until you type `/dash` or widen the window. `/dash` always opens it, at any width.
 - **Collapse the band:** click `[-]` at its right edge, or press `ctrl+x ctrl+a`.
 
@@ -66,7 +67,7 @@ Runs with nobody at the prompt (`claude -p`, the SDK) open no pane.
 
 How long a reply took is not repeated here: Claude Code already prints it just above the band (`✻ Baked for 15s`). The pane has it.
 
-The right end shows the session's cost (hidden until there is one) and the `/dash` button. On a narrow terminal `/dash` goes first, then the cost. If the list of agents cannot be read, `⚠ can't read agent list` appears there. Whatever is at the right end gives way before the state's title would be cut.
+The right end shows the session's cost (hidden until there is one) and the `/diff` and `/dash` buttons. `/diff` stays at any width it fits, because it is the way back from Claude Code's changes panel; on a narrow band, including the narrower band beside a docked pane, `/dash` goes first. When the row is crowded, `/dash` goes first, then `/diff`, then the cost. If the list of agents cannot be read, `⚠ can't read agent list` appears there. Whatever is at the right end gives way before the state's title would be cut.
 
 ### Row 2: what is left
 
@@ -103,7 +104,7 @@ The pane is a column of cards. The first three show where the session stands; th
 
 ```
 ╭──────────────────────────────────────────────────────────╮
-│ ● Working  reading model.ts                              │
+│ ● Working  reading model.ts                        /diff │
 │ Model       Haiku 5.5, medium effort                     │
 │ Last reply  4m ago, took 3s, edited 2 files              │
 ╰──────────────────────────────────────────────────────────╯
@@ -162,6 +163,20 @@ A background task's line says how it ended once its notification arrives, which 
 
 Docked beside the conversation (fullscreen), the pane fills the window's height and the log takes the rows the other cards leave. Above the prompt (not fullscreen), the log shows its last six lines.
 
+## Switching to the changes panel
+
+Claude Code has its own panel for the changes in your repository: the files changed and their diff, refreshed as Claude edits. You open it with Claude Code's `/diff` command. In fullscreen it uses the same place beside the conversation as the dashboard pane, so only one of the two is in front at a time.
+
+- **To see the changes:** click `/diff` at the right end of the pane's first card, or `/diff` in the band. Both do exactly what typing `/diff` does.
+- **To come back:** click `/diff` in the band again. The band stays on screen while the changes panel is up, and its `/diff` is kept even when the band is narrowed beside the panel. `/dash` (typed, or the band's button when the band is wide enough for it) also brings the dashboard back to the front.
+- **Tabs:** the changes panel is usually a tab named `Diff` next to the dashboard's `Session` tab, and clicking a tab switches straight away. Claude Code can also draw it the older way, covering the dashboard with no tab; the band's `/diff` still brings you back.
+- **While Claude is working:** Claude Code runs a command a mod asks for only after the current reply ends, so a click on `/diff` then waits until the reply is done. The mod says so in a small notice. A second click during the same reply is not added, since two waiting `/diff`s would open the panel and close it again; the notice says one is already waiting. Clicking the `Diff` or `Session` tab switches at once, but a `/diff` already waiting still runs when the reply ends, and it switches back.
+- **When `Diff` is a tab behind the dashboard:** `/diff`, in the band or the pane, closes it, the same as typing `/diff` does, so the first click seems to do nothing. Click `/diff` again to bring it up in front, or click the `Diff` tab. A mod can only run `/diff`, which switches the panel on or off; it cannot see whether `Diff` is open or ask for it to come to the front.
+
+- **On a terminal narrower than 144 columns:** Claude Code counts a panel opened through a mod's button as one you did not ask for, and only places those from 144 columns. So on a terminal 110 to 143 columns wide, the first click on `/diff` can answer "Resize your terminal to at least 110 columns to show the diff panel", even though yours is wide enough. Type `/diff` yourself once; after that the buttons open the panel at 110 columns or more. Going back (closing the panel) works at any width.
+
+Outside fullscreen, `/diff` opens Claude Code's diff dialog instead of a panel.
+
 ## Good to know
 
 - **What a reply "did":** `edited 3 files` counts the different files changed by Edit, Write or NotebookEdit during that reply, by the main conversation or by subagents that reply started. A file edited twice counts once. `used 2 subagents` counts the subagents that reply started, including ones they started themselves. Teammates are not counted, because they join the session rather than doing one reply's work; neither are a workflow's agents, which work for the workflow running in the background. A subagent left running in the background after an earlier reply does not add to a later one.
@@ -178,6 +193,7 @@ Docked beside the conversation (fullscreen), the pane fills the window's height 
 
 - **No band:** check `claude --version` (2.1.296 or newer) and that `mark-mod` is enabled under `/plugin`. Start Claude Code with `claude --debug` to see, in the debug log, why a hook was skipped.
 - **No pane at start:** the terminal is narrower than Claude Code allows for a pane nobody asked for. Type `/dash`.
+- **`/diff` shows no panel:** the changes panel needs a git repository, and in fullscreen a terminal at least 110 columns wide. If the button says to resize a terminal that is already 110 columns or wider, type `/diff` once yourself (see [Switching to the changes panel](#switching-to-the-changes-panel)). Claude Code prints the reason in the conversation. If the mod could not run `/diff` at all, its notice starts with `/diff did not run:` and gives Claude Code's reason.
 - **Update:** `claude plugin update mark-mod@mark-mod`, then `/reload-plugins` in any open session.
 - **Uninstall:** `/plugin uninstall mark-mod`.
 

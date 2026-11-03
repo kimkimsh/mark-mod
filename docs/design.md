@@ -9,7 +9,8 @@ what, where the tokens went, and, in its Activity log, what happened in what
 order.
 
 Shown at all times, above the prompt (the band), and in a pane that opens with
-the session (`/dash` closes and reopens it):
+the session (`/dash` closes and reopens it). Both carry a `/diff` button that
+switches the dock to Claude Code's own changes panel and back:
 
 | Item | Source (engine API, Claude Code 2.1.296+) |
 |---|---|
@@ -207,6 +208,68 @@ closed. That matters because `session.start` fires again within one process
 person's choice. A new process starts with the pane open. An unload never
 reaches the opener's hooks, so it is never taken for the person's close.
 
+## The changes panel
+
+Claude Code's changes panel (`/diff`: the changed files and their hunks) is the
+engine's, not the mod's. In 2.1.316 an engine flag picks one of two shapes,
+and both toggle on `/diff`:
+
+- a pane of a plugin bundled with Claude Code, a `Diff` tab in the same dock
+  as the session pane, one of the two in front;
+- the older diff sidebar, which takes the dock's place while shown and has
+  no tab.
+
+A plugin can open, show and list only its own panes: another plugin's opens
+and closes never reach this plugin's hooks, and under the sidebar the session
+pane still reads `isShown: true` while covered. The mod therefore cannot know
+whether the changes panel is up, so its buttons do not guess: each runs
+`$.command.run({ command: 'diff' })`, the same toggle the person gets by typing
+`/diff`. The band's `/diff` is the way back as well as the way there, because
+the band stays drawn under both shapes. It is kept at any width it fits: beside
+a dock the band's `bodyColumns` is the transcript column, about 72 at 140
+terminal columns, so a floor like `/dash`'s 80 cells would hide the way back
+exactly when it is needed. The pane's `/diff` sits at the right end of the
+State card's first row.
+
+`/dash` closes the pane only while the person can see it. A pane behind
+another pane's tab (`isShown: false`) is brought to the front by
+`$.ui.open({ focus: true })`, the only open that raises; an open of an open id
+without it only retitles. A closed pane is reopened by a plain open, and
+raised the same way if it lands behind another tab. The surface may still
+refuse (a draft in the prompt, a band element holding the keys, a dialog), and
+then `/dash` answers, and the band's button toasts, which tab shows the pane;
+an open answered `isPlaced: false` gives the engine's reason instead.
+
+The buttons are always drawn. `/diff` exists under both shapes, but at
+`session.start` `$.command.list()` does not have it yet (the bundled plugin
+registers it after), so a check there would hide a working button. A run the
+engine rejects toasts its reason.
+
+Limits, all the engine's:
+
+- `$.command.run` waits until the session is idle, so a press during a turn
+  runs when the turn ends; a toast says so. Under the tab shape a typed
+  `/diff` waits the same way. A tab click switches at once.
+- Two queued toggles would cancel out, so a press during a turn that already
+  has a `/diff` waiting (keyed by the turn record's `turnId`) is not queued;
+  a toast says one is waiting. A run once queued cannot be withdrawn: a tab
+  click made while it waits is undone when it runs.
+- With the `Diff` tab open behind the session pane, `/diff` from the band or
+  the pane closes it, as typed `/diff` does; a second press opens it in front.
+  Only a "show" call for another plugin's pane would fix this; the result's
+  text ("Diff panel hidden") could be matched to run it again, but that is the
+  engine's prose, not a contract.
+- An open is "asked" only with the person's command, prompt or press behind
+  it, and a press that goes through `$.command.run` reaches the diff plugin
+  as a plugin's command, so the `Diff` pane it opens is unasked: placed from
+  144 columns, or 110 once the person has opened it. Below 144 the first
+  button press is refused, and the diff plugin answers with its own
+  "Resize your terminal to at least 110 columns" text (seen live at 140
+  columns on 2.1.317); a typed `/diff` lowers the floor to 110 and the
+  buttons work after it. Closing needs no seat and works at any width.
+- Under the sidebar shape, `/dash` cannot see the sidebar covering the pane,
+  so it closes the hidden pane rather than raising it.
+
 ## Activity log
 
 A list in `$.state` (`activityLog`), one entry per event, newest last: time,
@@ -331,7 +394,7 @@ Band (2–3 rows, width = `props.bodyColumns`, indented two cells to line up
 with the engine's footer):
 
 ```
-  ● Working  editing view.tsx                                                                          $0.19 /dash
+  ● Working  editing view.tsx                                                                    $0.19 /diff /dash
   Context ███████░ 88% left   5-hour ████▌░░░ 45% left, runs out in 1h 35m at this pace   Weekly ███████▋ 96% left, resets in 6d 17h
   Subagents   Find callers of buildView (haiku, low effort) 40s     Background   npm test 20s
 ```
@@ -345,9 +408,10 @@ window is on pace to run out before its reset (linear projection, not before
 Width is spent by priority, measured in terminal cells (Hangul is two). Row 1:
 the title is never cut; detail clauses drop whole from the end, and only a
 live activity is clipped (dropping it would leave nothing); the right-hand
-group drops `/dash` below 80 cells, then cost below 56, and gives way from the
-end (`/dash`, cost, the list notice, the folded gauge) whenever it and the
-title would overrun the row. Row 2 holds Context, 5-hour and Weekly; any
+group drops `/dash` below 80 cells and cost below 56, keeps `/diff` at any
+width, and gives way from the end (`/dash`, `/diff`, cost, the list notice,
+the folded gauge)
+whenever it and the title would overrun the row. Row 2 holds Context, 5-hour and Weekly; any
 other window the API reports (a spend limit, a per-model week) is the pane's.
 Values first;
 then the 5-hour note, the weekly note, and 8-cell bars, which are decided by
@@ -362,8 +426,8 @@ none), then whole items fold into `+N more`, so no name or age is cut.
 Pane: a column of rounded cards, every body row a single row that truncates
 rather than wraps, so a card's height is its row count.
 
-1. **State**: the band's title (and its detail while live), Model, Last
-   reply. The border takes the state's colour unless the session is at rest
+1. **State**: the band's title (and its detail while live) with the `/diff`
+   button at the row's right end, Model, Last reply. The border takes the state's colour unless the session is at rest
    (done, interrupted, ready). Whether a main turn runs is the engine's
    `isWorking`, which only the band's props carry: the band keeps the last
    value it drew and redraws the plugin's sites when it changes, and before

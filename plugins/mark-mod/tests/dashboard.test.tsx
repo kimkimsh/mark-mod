@@ -14,6 +14,8 @@ const PANE_BODY_ROWS = 40
 
 const SURFACES = ['terminal', 'desktop'] as const
 
+const DASH_RUN = { command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } } as const
+
 type World = {
   clock: MockClock
   agents: AgentInfo[]
@@ -22,8 +24,22 @@ type World = {
   openPanes: string[]
   // Open but undrawn, as an unasked open leaves a pane on a narrow terminal.
   undrawnPanes: Set<string>
+  // Open and drawn, but a tab behind the pane in front.
+  behindPanes: Set<string>
+  // The surface refuses to raise a pane, as it does while the prompt holds a draft.
+  isRaiseRefused: boolean
+  // A pane opened now lands behind the one in front, as beside the changes panel.
+  opensBehind: boolean
+  // Why every open answers undrawn, or null while opens are drawn.
+  openWaitReason: string | null
+  // Why the surface refuses to close a pane, or null while it closes them.
+  closeError: string | null
+  diffRuns: number
+  diffError: string | null
+  toasts: string[]
   env: Map<string, string>
 }
+
 
 type StoredEntries = Parameters<typeof mock.store>[1]
 
@@ -35,6 +51,14 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
     usage: { startedAt: START, context: { window: 200_000 }, rateLimits: [] },
     openPanes: [],
     undrawnPanes: new Set(),
+    behindPanes: new Set(),
+    isRaiseRefused: false,
+    opensBehind: false,
+    openWaitReason: null,
+    closeError: null,
+    diffRuns: 0,
+    diffError: null,
+    toasts: [],
     env: new Map(),
   }
 
@@ -56,19 +80,59 @@ function boot(on: On, sessionId: string, stored?: StoredEntries): World {
   on('session.usage', () => ({ value: world.usage }))
   on('env.get', ($, e) => ({ value: world.env.get(e.name) }))
   on('ui.panes', () => ({
-    value: world.openPanes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: !world.undrawnPanes.has(id) })),
+    value: world.openPanes.map(id => ({
+      id,
+      title: id,
+      isShown: !world.behindPanes.has(id) && !world.undrawnPanes.has(id),
+      isFocused: false,
+      isPlaced: !world.undrawnPanes.has(id),
+    })),
   }))
   on('ui.open', ($, e) => {
     if (!world.openPanes.includes(e.id)) {
       world.openPanes.push(e.id)
+
+      if (world.opensBehind) {
+        world.behindPanes.add(e.id)
+      }
+    }
+
+    if (world.openWaitReason !== null) {
+      world.undrawnPanes.add(e.id)
+
+      return { value: { isPlaced: false, reason: world.openWaitReason } }
     }
 
     world.undrawnPanes.delete(e.id)
 
+    if (e.focus === true && !world.isRaiseRefused) {
+      world.behindPanes.delete(e.id)
+    }
+
     return { value: { isPlaced: true } }
   })
+  on('command.run', { command: 'diff' }, () => {
+    if (world.diffError !== null) {
+      throw new Error(world.diffError)
+    }
+
+    world.diffRuns += 1
+
+    return {}
+  })
+  on('ui.toast', ($, e) => {
+    world.toasts.push(e.text)
+
+    return { value: undefined }
+  })
   on('ui.close', ($, e) => {
+    if (world.closeError !== null) {
+      throw new Error(world.closeError)
+    }
+
     world.openPanes = world.openPanes.filter(id => id !== e.id)
+    world.undrawnPanes.delete(e.id)
+    world.behindPanes.delete(e.id)
 
     return { value: undefined }
   })
@@ -379,7 +443,7 @@ describe('band', () => {
     await $.turn.start({ text: 'go', turnId: 'turn-1' })
     await world.clock.advance(72_000)
 
-    expect(await bandText($, true, 140)).toContain('● Working/dash')
+    expect(await bandText($, true, 140)).toContain('● Working/diff/dash')
 
     const asking = $.tool.call({ tool: 'ExitPlanMode', tool_use_id: 'plan-1' })
     await world.clock.advance(20_000)
@@ -1070,11 +1134,11 @@ describe('pane', () => {
 
     expect(world.openPanes).toEqual([PANE_ID])
 
-    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await $.command.run(DASH_RUN)
 
     expect(world.openPanes).toEqual([])
 
-    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await $.command.run(DASH_RUN)
 
     expect(world.openPanes).toEqual([PANE_ID])
   })
@@ -1082,12 +1146,12 @@ describe('pane', () => {
   test('a pane the person closed stays closed when the mod starts again in the same process', async ($, on) => {
     const world = boot(on, SESSION_ID)
     await start($)
-    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await $.command.run(DASH_RUN)
     await start($)
 
     expect(world.openPanes).toEqual([])
 
-    await $.command.run({ command: 'dash', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+    await $.command.run(DASH_RUN)
     await start($)
 
     expect(world.openPanes).toEqual([PANE_ID])
@@ -1366,6 +1430,181 @@ async function logCard($: Engine, bodyRows: number, placement: 'dock' | 'inline'
 
   return text
 }
+
+describe('changes panel', () => {
+  test('the band offers /diff before /dash, and its /diff runs the engine\'s command', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    const text = await bandText($, false, 140)
+
+    expect(text).toContain('/diff')
+    expect(text.indexOf('/diff')).toBeLessThan(text.indexOf('/dash'))
+
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'diff' })
+
+    expect(world.diffRuns).toBe(1)
+    expect(world.openPanes).toEqual([PANE_ID])
+    expect(world.toasts).toEqual([])
+  })
+
+  test('the pane\'s State card has a /diff button that runs the command', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+
+    expect(await paneCardText($, 90, 'session')).toContain('/diff')
+
+    const ui = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
+    await ui.press({ key: 'diff' })
+
+    expect(world.diffRuns).toBe(1)
+  })
+
+  test('beside a dock the band keeps /diff, the way back, and drops /dash', async ($, on) => {
+    boot(on, SESSION_ID)
+    await start($)
+
+    for (const columns of [50, 72]) {
+      const text = await bandText($, false, columns)
+
+      expect(text).toContain('/diff')
+      expect(text).not.toContain('/dash')
+    }
+  })
+
+  test('a band too narrow for /diff beside the title drops it rather than cut the title', async ($, on) => {
+    boot(on, SESSION_ID)
+    await start($)
+    const text = await bandText($, false, 12)
+
+    expect(text).toContain('Ready')
+    expect(text).not.toContain('/diff')
+  })
+
+  test('a press during a turn says /diff waits for it, and still asks for the run', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    const ui = await band($, 'terminal', true, 140, 5)
+    await ui.press({ key: 'diff' })
+
+    expect(world.toasts).toEqual(['/diff runs once Claude finishes this turn'])
+    expect(world.diffRuns).toBe(1)
+  })
+
+  test('a second press in the same turn is not queued behind the first; the next turn takes one again', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    const ui = await band($, 'terminal', true, 140, 5)
+    await ui.press({ key: 'diff' })
+    await ui.press({ key: 'diff' })
+
+    expect(world.diffRuns).toBe(1)
+    expect(world.toasts).toEqual(['/diff runs once Claude finishes this turn', '/diff is already waiting for this turn to finish'])
+
+    await $.turn.start({ text: 'again', turnId: 'turn-2' })
+    await ui.press({ key: 'diff' })
+
+    expect(world.diffRuns).toBe(2)
+  })
+
+  test('a pane press during a turn says /diff waits too, with no band drawn', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    const ui = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
+    await ui.press({ key: 'diff' })
+
+    expect(world.toasts).toEqual(['/diff runs once Claude finishes this turn'])
+  })
+
+  test('a /diff the engine refuses says why', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.diffError = 'not in a git repository'
+    await start($)
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'diff' })
+
+    expect(world.toasts).toHaveLength(1)
+    expect(world.toasts[0]).toContain('/diff did not run')
+  })
+
+  test('/dash brings the pane to the front from behind another pane, and closes it once in front', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.behindPanes.add(PANE_ID)
+    const raised = await $.command.run(DASH_RUN)
+
+    expect(raised.text).toBeUndefined()
+    expect(world.openPanes).toEqual([PANE_ID])
+    expect(world.behindPanes.has(PANE_ID)).toBe(false)
+
+    await $.command.run(DASH_RUN)
+
+    expect(world.openPanes).toEqual([])
+  })
+
+  test('the band\'s /dash raises a pane behind another one too', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.behindPanes.add(PANE_ID)
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'dash' })
+
+    expect(world.openPanes).toEqual([PANE_ID])
+    expect(world.behindPanes.has(PANE_ID)).toBe(false)
+  })
+
+  test('/dash reopening a closed pane behind the changes panel brings it to the front', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    await $.command.run(DASH_RUN)
+    world.opensBehind = true
+    const result = await $.command.run(DASH_RUN)
+
+    expect(result.text).toBeUndefined()
+    expect(world.openPanes).toEqual([PANE_ID])
+    expect(world.behindPanes.has(PANE_ID)).toBe(false)
+  })
+
+  test('a raise the surface cannot draw says why the pane waits', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.behindPanes.add(PANE_ID)
+    world.openWaitReason = 'the terminal is 100 columns'
+    const result = await $.command.run(DASH_RUN)
+
+    expect(result.text).toContain('waiting for room: the terminal is 100 columns')
+  })
+
+  test('a band /dash the engine refuses says why', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    world.closeError = 'the surface is gone'
+    await start($)
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'dash' })
+
+    expect(world.toasts).toHaveLength(1)
+    expect(world.toasts[0]).toContain('/dash did not run')
+  })
+
+  test('a pane the surface keeps behind is left open, with word of its tab', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    await start($)
+    world.behindPanes.add(PANE_ID)
+    world.isRaiseRefused = true
+    const result = await $.command.run(DASH_RUN)
+
+    expect(result.text).toContain('behind another pane')
+    expect(world.openPanes).toEqual([PANE_ID])
+
+    const ui = await band($, 'terminal', false, 140, 5)
+    await ui.press({ key: 'dash' })
+
+    expect(world.toasts).toHaveLength(1)
+    expect(world.toasts[0]).toContain('Session tab')
+  })
+})
 
 describe('activity log', () => {
   test('a reply logs the prompt, each call, a denied call and how it ended, in order', async ($, on) => {

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderSurface, ToolCallInput, ToolCallResult, UiScrollInput } from 'claude-code'
+import type { Elements, EngineInterface, Register, RenderSurface, ToolCallInput, ToolCallResult, UiScrollInput } from 'claude-code'
 
 import type {
   DashAgent,
@@ -82,12 +82,23 @@ import type {
   UsageReading,
 } from './model'
 import { bandTree, paneTree } from './view'
+import type { BandButton, BandButtons } from './view'
 
 const PANE_ID = 'mark-mod'
 
 const PANE_TITLE = 'Session'
 
 const COMMAND = 'dash'
+
+// The engine's own command for its changes panel; the band and the pane run it
+// as the person would, since a plugin can neither open nor show another's pane.
+const DIFF_COMMAND = 'diff'
+
+const DIFF_WAITS_TEXT = `/${DIFF_COMMAND} runs once Claude finishes this turn`
+
+const DIFF_ALREADY_WAITS_TEXT = `/${DIFF_COMMAND} is already waiting for this turn to finish`
+
+const BEHIND_TEXT = `The session pane is behind another pane; its ${PANE_TITLE} tab shows it`
 
 const TICK_MS = 1000
 
@@ -162,6 +173,11 @@ const paneLayouts = new Map<RenderSurface, PaneLayout>()
 // carried it; null before the band is drawn. The pane has no such prop, and
 // the turn record may have missed a turn's end.
 let engineIsWorking: boolean | null = null
+
+// The turn a /diff press is waiting on. The engine runs a plugin's command
+// once the turn ends, and a second toggle queued behind the first would hide
+// the panel the first one showed.
+let diffWaitTurnId: string | null = null
 
 type SavedSession = { tokens: DashTokens; savedAt: number }
 
@@ -783,21 +799,112 @@ async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
   }
 }
 
-// A pane opened unasked on a narrow terminal is open but undrawn; to the
-// person it is closed, so /dash draws it rather than closing it.
-async function togglePane($: EngineInterface): Promise<string | null> {
-  const panes = await $.ui.panes()
+function waitingText(reason: string): string {
+  return `The session pane is waiting for room: ${reason}`
+}
 
-  if (panes.some(pane => pane.id === PANE_ID && pane.isPlaced)) {
+async function isPaneShown($: EngineInterface): Promise<boolean> {
+  return (await $.ui.panes()).some(one => one.id === PANE_ID && one.isShown)
+}
+
+// Only an open asking for the keyboard brings an open pane to the front, and
+// the surface may refuse it, so the pane is read again afterwards.
+async function raisePane($: EngineInterface): Promise<string | null> {
+  const raised = await $.ui.open({ id: PANE_ID, title: PANE_TITLE, focus: true })
+
+  if (!raised.isPlaced) {
+    return waitingText(raised.reason)
+  }
+
+  return (await isPaneShown($)) ? null : BEHIND_TEXT
+}
+
+// /dash closes the pane only when the person can see it. One opened unasked on
+// a narrow terminal is open but undrawn, so it is drawn; one behind another
+// pane's tab (the engine's changes panel, say), or opened behind it, is
+// brought to the front. Resolves to what the person should be told, or null.
+async function togglePane($: EngineInterface): Promise<string | null> {
+  const pane = (await $.ui.panes()).find(one => one.id === PANE_ID && one.isPlaced)
+
+  if (pane?.isShown === true) {
     await $.ui.close({ id: PANE_ID })
 
     return null
   }
 
-  const opened = await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
-  await update($, paneClosedAtom, () => false)
+  if (pane === undefined) {
+    const opened = await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
+    await update($, paneClosedAtom, () => false)
 
-  return opened.isPlaced ? null : opened.reason
+    if (!opened.isPlaced) {
+      return waitingText(opened.reason)
+    }
+
+    if (await isPaneShown($)) {
+      return null
+    }
+  }
+
+  return raisePane($)
+}
+
+async function pressDash($: EngineInterface): Promise<void> {
+  try {
+    const text = await togglePane($)
+
+    if (text !== null) {
+      $.ui.toast(text)
+    }
+  } catch (cause) {
+    $.ui.toast(`/${COMMAND} did not run: ${errorText(cause)}`)
+  }
+}
+
+// The engine holds a plugin's command run until the turn ends, so a press
+// during a turn says so rather than seeming to do nothing, and a second press
+// in that turn is not queued behind the first.
+async function runDiff($: EngineInterface): Promise<void> {
+  const turn = await read($, turnAtom)
+
+  if (engineIsWorking ?? turn !== null) {
+    if (turn !== null && turn.turnId === diffWaitTurnId) {
+      $.ui.toast(DIFF_ALREADY_WAITS_TEXT)
+
+      return
+    }
+
+    diffWaitTurnId = turn?.turnId ?? null
+    $.ui.toast(DIFF_WAITS_TEXT)
+  }
+
+  try {
+    await $.command.run({ command: DIFF_COMMAND })
+  } catch (cause) {
+    $.ui.toast(`/${DIFF_COMMAND} did not run: ${errorText(cause)}`)
+  }
+}
+
+type ButtonKit = Pick<Elements['mobile'], 'Button'>
+
+function commandButton(kit: ButtonKit, command: string, onPress: () => void): BandButton {
+  const { Button } = kit
+  const label = `/${command}`
+
+  return { key: command, text: label, element: <Button key={command} plain dimColor label={label} onPress={onPress} /> }
+}
+
+function diffButton($: EngineInterface, kit: ButtonKit): BandButton {
+  return commandButton(kit, DIFF_COMMAND, () => {
+    void runDiff($)
+  })
+}
+
+function bandButtons($: EngineInterface, kit: ButtonKit): BandButtons {
+  const dash = commandButton(kit, COMMAND, () => {
+    void pressDash($)
+  })
+
+  return { diff: diffButton($, kit), dash }
 }
 
 // Rate-limit windows are the account's and stay, and so does the model the
@@ -1154,9 +1261,9 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: COMMAND }, async $ => {
-    const waiting = await togglePane($)
+    const text = await togglePane($)
 
-    return waiting === null ? {} : { text: `The session pane is waiting for room: ${waiting}` }
+    return text === null ? {} : { text }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -1171,24 +1278,11 @@ export const register: Register = on => {
     }
 
     const kit = $.ui.resolve(e)
-    const { Button } = kit
     // The engine knows whether a main turn runs; the turn record may have
     // missed its end.
     const view = buildView({ ...(await snapshotOf($)), isWorking: e.props.isWorking })
 
-    const trailing = (
-      <Button
-        key={COMMAND}
-        plain
-        dimColor
-        label={`/${COMMAND}`}
-        onPress={() => {
-          void togglePane($)
-        }}
-      />
-    )
-
-    return bandTree(kit, view, e.props.bodyColumns, e.props.maxRows, trailing)
+    return bandTree(kit, view, e.props.bodyColumns, e.props.maxRows, bandButtons($, kit))
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
@@ -1197,7 +1291,8 @@ export const register: Register = on => {
     const log = { entries: await read($, logAtom), anchor: await read($, logAnchorAtom) }
     const { scroll } = e.props
     const frame = { columns: e.props.bodyColumns, bodyRows: scroll.bodyRows, isDocked: e.props.placement === 'dock' }
-    const drawing = paneTree($.ui.resolve(e), view, log, frame)
+    const kit = $.ui.resolve(e)
+    const drawing = paneTree(kit, view, log, frame, diffButton($, kit).element)
     paneLayouts.set(e.surface, { bodyRows: scroll.bodyRows, logTop: drawing.logTop, logRows: drawing.logRows, offset: scroll.offset })
 
     return drawing.tree
