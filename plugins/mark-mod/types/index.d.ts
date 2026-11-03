@@ -83,6 +83,25 @@ export type DashAgentWork = { activity: string | null; callId: string | null; co
 
 export type DashAgentWorks = Record<string, DashAgentWork>
 
+// Who an activity entry is about: the person, the main conversation, an
+// agent, a background task, or the session itself (a compaction).
+export type DashLogSource = 'you' | 'main' | 'subagent' | 'teammate' | 'task' | 'session'
+
+// How an entry ended something: plain for a start or a step, the rest for an
+// outcome.
+export type DashLogTone = 'plain' | 'done' | 'failed' | 'stopped'
+
+// seq rises by one per entry within a conversation; a log scrolled back holds
+// its place by it while newer entries arrive.
+export type DashLogEntry = { seq: number; at: number; source: DashLogSource; who: string; text: string; tone: DashLogTone }
+
+// An agent as its spawn named it, by agent id: its calls before the list
+// names it are logged under this name, and one the list first names already
+// ended still logs its end.
+export type DashSpawn = { name: string; isTeammate: boolean }
+
+export type DashSpawns = Record<string, DashSpawn>
+
 // $.state outlives a reload, so a value whose form changes moves to a new key,
 // under which the old value reads as absent. The engine's own tag for this,
 // AtomOptions' `shape`, is an identifier the repo's no-shape-in-symbol-names
@@ -103,6 +122,14 @@ declare module 'claude-code' {
       mainModel: DashAgentModel | null
       compactions: number
       paneClosed: boolean
+      spawns: DashSpawns
+      // Tasks the Stop snapshot took down before their notification came; the
+      // notification still words how each ended.
+      endingTasks: DashTask[]
+      activityLog: DashLogEntry[]
+      // The seq of the newest entry the scrolled-back log shows at its bottom;
+      // null while it follows the newest.
+      logAnchor: number | null
     }
   }
 }

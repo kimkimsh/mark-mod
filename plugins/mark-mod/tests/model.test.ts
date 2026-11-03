@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { DashCall, DashLive, DashTask, DashTurnEnd } from '../types'
+import type { DashAgent, DashCall, DashLive, DashLogEntry, DashTask, DashTurnEnd } from '../types'
 import {
   activityOf,
   addTokens,
+  agentActor,
+  agentEndLines,
   agentsFromReading,
   barCells,
   buildView,
+  clockText,
   cellWidth,
   clipCells,
   effortLabel,
@@ -15,11 +18,18 @@ import {
   formatCost,
   formatDuration,
   formatTokens,
-  endedTaskIds,
+  logWindow,
+  endedTasks,
   livePaneIds,
   modelDetailText,
   modelFamily,
   modelName,
+  promptLine,
+  rowBeforeMove,
+  scrolledAnchor,
+  spawnedName,
+  splitCells,
+  turnEndLine,
   newTurn,
   paneListingArgv,
   paneRosterFromText,
@@ -32,6 +42,7 @@ import {
   withAnsweredModel,
   withEdit,
   withKnownLimits,
+  withLogLines,
   withRequest,
   withSpawn,
   withSpawnModel,
@@ -114,14 +125,17 @@ describe('formatting', () => {
 })
 
 describe('readings', () => {
-  test('a notification names the tasks it ends, and only those', () => {
+  test('a notification names the tasks it ends and how, and only those', () => {
     const one = '<task-notification>\n<task-id>bvcykn48s</task-id>\n<status>completed</status>\n</task-notification>'
     const event = '<task-notification><task-id>mon-1</task-id><status>event</status></task-notification>'
     const failed = '<task-notification><task-id>sh-2</task-id><status>failed</status></task-notification>'
 
-    expect(endedTaskIds(one)).toEqual(['bvcykn48s'])
-    expect(endedTaskIds(`${one}\n${event}\n${failed}`)).toEqual(['bvcykn48s', 'sh-2'])
-    expect(endedTaskIds('plain prompt')).toEqual([])
+    expect(endedTasks(one)).toEqual([{ id: 'bvcykn48s', tone: 'done' }])
+    expect(endedTasks(`${one}\n${event}\n${failed}`)).toEqual([
+      { id: 'bvcykn48s', tone: 'done' },
+      { id: 'sh-2', tone: 'failed' },
+    ])
+    expect(endedTasks('plain prompt')).toEqual([])
   })
 
   test('a missing reading stays missing, not zero', () => {
@@ -636,5 +650,153 @@ describe('meters', () => {
 
     expect(meters.map(meter => meter.key)).toEqual(['context', 'five_hour', 'seven_day', 'spend_limit', 'seven_day_opus'])
     expect(meters.map(meter => meter.label).slice(3)).toEqual(['Spend limit', 'Seven day opus'])
+  })
+})
+
+function entries(count: number): DashLogEntry[] {
+  return withLogLines(
+    [],
+    Array.from({ length: count }, (_, index) => ({ source: 'main', who: 'Claude', at: NOW + index, text: `step ${index}`, tone: 'plain' })),
+  )
+}
+
+const RUNNING_AGENT: DashAgent = {
+  id: 'a1',
+  label: 'Explore',
+  description: 'find callers',
+  status: 'running',
+  isTeammate: false,
+  isNested: false,
+  firstSeenAt: NOW - 40_000,
+}
+
+describe('activity log', () => {
+  test('entries number on from the last, keep the newest 200, and clip long text', () => {
+    const log = entries(3)
+
+    expect(log.map(entry => entry.seq)).toEqual([1, 2, 3])
+    expect(withLogLines(log, [])).toBe(log)
+
+    const long = withLogLines(entries(205), [{ source: 'you', who: 'you', at: NOW, text: 'x'.repeat(300), tone: 'plain' }])
+
+    expect(long).toHaveLength(200)
+    expect(long[0]?.seq).toBe(7)
+    expect(long[199]?.seq).toBe(206)
+    expect(long[199]?.text.length).toBeLessThan(300)
+  })
+
+  test('a following window shows the newest rows, and says how many are above', () => {
+    const window = logWindow(entries(10), null, 4)
+
+    expect(window.entries.map(entry => entry.text)).toEqual(['step 6', 'step 7', 'step 8', 'step 9'])
+    expect(window).toMatchObject({ newer: 0, older: 6 })
+    expect(logWindow(entries(2), null, 4)).toMatchObject({ newer: 0, older: 0 })
+  })
+
+  test('a held window keeps its entries while newer ones arrive below', () => {
+    const log = entries(10)
+    const anchor = scrolledAnchor(log, null, 4, -3)
+
+    expect(anchor).toBe(7)
+
+    const later = withLogLines(log, [{ source: 'main', who: 'Claude', at: NOW, text: 'step 10', tone: 'plain' }])
+    const window = logWindow(later, anchor, 4)
+
+    expect(window.entries.map(entry => entry.text)).toEqual(['step 3', 'step 4', 'step 5', 'step 6'])
+    expect(window).toMatchObject({ newer: 4, older: 3 })
+  })
+
+  test('scrolling stops at a full first window, and reaching the newest follows again', () => {
+    const log = entries(10)
+
+    expect(scrolledAnchor(log, null, 4, -100)).toBe(4)
+    expect(logWindow(log, 4, 4).older).toBe(0)
+    expect(scrolledAnchor(log, 4, 4, 100)).toBeNull()
+    expect(scrolledAnchor(log, 4, 4, 5)).toBe(9)
+    expect(scrolledAnchor(log, 9, 4, 1)).toBeNull()
+    expect(scrolledAnchor(entries(3), null, 4, -1)).toBeNull()
+    expect(scrolledAnchor([], null, 4, -1)).toBeNull()
+  })
+
+  test('an anchor that fell off the top holds the oldest full window', () => {
+    const log = entries(205).slice(-200)
+
+    expect(logWindow(log, 2, 4).entries.map(entry => entry.seq)).toEqual([6, 7, 8, 9])
+  })
+
+  test('an agent logs its end once, when the list stops calling it running', () => {
+    const done: DashAgent = { ...RUNNING_AGENT, status: 'completed' }
+
+    const none = new Set<string>()
+
+    expect(agentEndLines([RUNNING_AGENT], [done], none, NOW)).toEqual([
+      { source: 'subagent', who: 'Explore', at: NOW, text: 'done in 40s: find callers', tone: 'done' },
+    ])
+    expect(agentEndLines([done], [done], none, NOW)).toEqual([])
+    expect(agentEndLines([RUNNING_AGENT], [RUNNING_AGENT], none, NOW)).toEqual([])
+    expect(agentEndLines([RUNNING_AGENT], [{ ...RUNNING_AGENT, status: 'killed', isTeammate: true }], none, NOW)[0]).toMatchObject({
+      source: 'teammate',
+      tone: 'stopped',
+      text: 'stopped after 40s: find callers',
+    })
+  })
+
+  test('an agent no pull saw running still logs its end, and one that left the list ends plainly', () => {
+    const failed: DashAgent = { ...RUNNING_AGENT, status: 'failed' }
+
+    expect(agentEndLines([], [failed], new Set(['a1']), NOW)).toMatchObject([{ tone: 'failed', text: 'failed after 40s: find callers' }])
+    expect(agentEndLines([], [failed], new Set<string>(), NOW)).toEqual([])
+    expect(agentEndLines([RUNNING_AGENT], [], new Set<string>(), NOW)).toMatchObject([{ tone: 'plain', text: 'ended after 40s: find callers' }])
+    expect(agentEndLines([failed], [], new Set<string>(), NOW)).toEqual([])
+  })
+
+  test('an agent the list has not named yet logs under its spawn\'s name', () => {
+    const spawns = { a2: { name: 'scout', isTeammate: true } }
+
+    expect(agentActor([RUNNING_AGENT], spawns, 'a1')).toEqual({ source: 'subagent', who: 'Explore' })
+    expect(agentActor([], spawns, 'a2')).toEqual({ source: 'teammate', who: 'scout' })
+    expect(agentActor([], spawns, 'a3')).toEqual({ source: 'subagent', who: 'agent' })
+    expect(agentActor([], spawns, undefined)).toEqual({ source: 'main', who: 'Claude' })
+  })
+
+  test('a teammate is named as its team named it', () => {
+    expect(spawnedName('scout', 'general-purpose', 'scout-2@team-a')).toBe('scout-2')
+    expect(spawnedName('scout', 'general-purpose', undefined)).toBe('scout')
+    expect(spawnedName(undefined, 'Explore', undefined)).toBe('Explore')
+  })
+
+  test('the row a scroll started at comes from the move, the last drawing only at a clamp', () => {
+    const tree = { bodyRows: 10, contentRows: 30 }
+
+    expect(rowBeforeMove({ ...tree, offset: 7, by: 1 }, 2)).toBe(6)
+    expect(rowBeforeMove({ ...tree, offset: 6, by: -1 }, 2)).toBe(7)
+    expect(rowBeforeMove({ ...tree, offset: 0, by: -3 }, 2)).toBe(2)
+    expect(rowBeforeMove({ ...tree, offset: 0, by: -3 }, 9)).toBe(3)
+    expect(rowBeforeMove({ ...tree, offset: 20, by: 3 }, 12)).toBe(17)
+    expect(rowBeforeMove({ ...tree, offset: 20, by: 3 }, 19)).toBe(19)
+  })
+
+  test('a reply\'s end says how it ended; only an answer lists its work', () => {
+    const end: DashTurnEnd = { reason: 'answer', endedAt: NOW, durationMs: 45_000, editedFiles: 2, subagentsStarted: 1 }
+
+    expect(turnEndLine(end)).toMatchObject({ who: 'Claude', tone: 'done', text: 'replied in 45s, edited 2 files, used 1 subagent' })
+    expect(turnEndLine({ ...end, reason: 'aborted', durationMs: 12_000 })).toMatchObject({ tone: 'stopped', text: 'interrupted after 12s' })
+    expect(turnEndLine({ ...end, reason: 'error' }).tone).toBe('failed')
+  })
+
+  test('a prompt logs its first line, and an empty one nothing', () => {
+    expect(promptLine('  fix it\nthen test', NOW)).toMatchObject({ source: 'you', text: 'fix it' })
+    expect(promptLine('   ', NOW)).toBeNull()
+  })
+
+  test('times read as a wall clock, with or without seconds', () => {
+    expect(clockText(NOW, true)).toMatch(/^\d\d:\d\d:\d\d$/)
+    expect(clockText(NOW, false)).toMatch(/^\d\d:\d\d$/)
+  })
+
+  test('a split bar spans its cells, the first part by its share', () => {
+    expect(splitCells(75, 8)).toEqual({ first: '██████', second: '██' })
+    expect(splitCells(0, 4)).toEqual({ first: '', second: '████' })
+    expect(splitCells(100, 4)).toEqual({ first: '████', second: '' })
   })
 })

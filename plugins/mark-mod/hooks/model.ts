@@ -9,6 +9,10 @@ import type {
   DashCounts,
   DashLimit,
   DashLive,
+  DashLogEntry,
+  DashLogSource,
+  DashLogTone,
+  DashSpawns,
   DashTask,
   DashTokens,
   DashTurn,
@@ -124,9 +128,14 @@ const TASK_ID_PATTERN = /<task-id>([^<]+)<\/task-id>/
 
 const TASK_STATUS_PATTERN = /<status>([^<]+)<\/status>/
 
-// Words a notification ends a task with; any other word (a monitor's event,
-// a progress note) leaves the task running until the Stop snapshot says.
-const ENDED_TASK_STATUSES = new Set(['completed', 'failed', 'killed'])
+// Words a notification ends a task with, and the agent statuses that end an
+// agent; any other word (a monitor's event, a progress note) leaves the task
+// running until the Stop snapshot says.
+const END_TONES = new Map<string, DashLogTone>([
+  ['completed', 'done'],
+  ['failed', 'failed'],
+  ['killed', 'stopped'],
+])
 
 export const CONTEXT_METER_KEY = 'context'
 
@@ -201,8 +210,10 @@ export type WorkerView = {
   contextText: string
 }
 
+// mainPercent: the main conversation's share of the total, null before any.
 export type TokenView = {
   hasTokens: boolean
+  mainPercent: number | null
   totalText: string
   costText: string | null
   inputText: string
@@ -406,12 +417,28 @@ export function livePaneIds(listing: string): Set<string> {
   return live
 }
 
+// What the pane check found, by teammateId: panes gone or dead, and panes it
+// could not look at (tmux did not run), which says nothing either way.
+export type PaneCheck = { ended: ReadonlySet<string>; unchecked: ReadonlySet<string> }
+
 // A pane teammate's list status is the last word it wrote in the roster, which
-// a pane that closes or dies leaves standing.
-export function withEndedPanes(agents: readonly AgentReading[], ended: ReadonlySet<string>): AgentReading[] {
-  return agents.map(agent =>
-    agent.teammateId !== undefined && ended.has(agent.teammateId) ? { ...agent, status: 'killed' } : agent,
-  )
+// a pane that closes or dies leaves standing. An unchecked pane keeps the end
+// the last refresh gave it (`endedBefore`, by agent id), so a tmux call that
+// fails does not bring a dead pane's teammate back to running.
+export function withEndedPanes(
+  agents: readonly AgentReading[],
+  check: PaneCheck,
+  endedBefore: ReadonlySet<string>,
+): AgentReading[] {
+  return agents.map(agent => {
+    const { teammateId } = agent
+
+    const isEnded =
+      teammateId !== undefined &&
+      (check.ended.has(teammateId) || (check.unchecked.has(teammateId) && endedBefore.has(agent.id)))
+
+    return isEnded ? { ...agent, status: 'killed' } : agent
+  })
 }
 
 export function isAskingTool(tool: string): boolean {
@@ -548,21 +575,23 @@ function joinedList(items: readonly string[]): string {
   return `${items.slice(0, -1).join(CLAUSE_JOINER)} and ${items[items.length - 1] ?? ''}`
 }
 
+export type EndedTask = { id: string; tone: DashLogTone }
+
 // One prompt may carry several notifications when tasks end together.
-export function endedTaskIds(text: string): string[] {
-  const ids: string[] = []
+export function endedTasks(text: string): EndedTask[] {
+  const ended: EndedTask[] = []
 
   for (const notification of text.matchAll(NOTIFICATION_PATTERN)) {
     const body = notification[1] ?? ''
     const id = TASK_ID_PATTERN.exec(body)?.[1]?.trim()
-    const status = TASK_STATUS_PATTERN.exec(body)?.[1]?.trim()
+    const tone = END_TONES.get(TASK_STATUS_PATTERN.exec(body)?.[1]?.trim() ?? '')
 
-    if (id !== undefined && status !== undefined && ENDED_TASK_STATUSES.has(status)) {
-      ids.push(id)
+    if (id !== undefined && tone !== undefined) {
+      ended.push({ id, tone })
     }
   }
 
-  return ids
+  return ended
 }
 
 function parseResetTime(resetsAt: string | undefined): number | null {
@@ -1130,9 +1159,12 @@ function limitsNoteOf(usage: DashUsage | null, hasResponse: boolean): string | n
 function tokenView(tokens: DashTokens, costUsd: number | null): TokenView {
   const all = mergeCounts(tokens.main, tokens.agents)
 
+  const total = sumCounts(all)
+
   return {
-    hasTokens: sumCounts(all) > 0,
-    totalText: formatTokens(sumCounts(all)),
+    hasTokens: total > 0,
+    mainPercent: total === 0 ? null : (sumCounts(tokens.main) * PERCENT_FULL) / total,
+    totalText: formatTokens(total),
     costText: costUsd === null || costUsd <= 0 ? null : formatCost(costUsd),
     inputText: formatTokens(all.input),
     outputText: formatTokens(all.output),
@@ -1305,6 +1337,271 @@ function headlineOf(snapshot: DashSnapshot, workers: WorkerCounts): Headline {
   const end = TURN_END_TITLES[snapshot.lastTurn.reason]
 
   return { phase: end.phase, title: end.title, detail: [formatAgo(now - snapshot.lastTurn.endedAt), ...turnEndWork(snapshot.lastTurn)] }
+}
+
+// A conversation's log keeps its latest entries; older ones fall off the top.
+const LOG_MAX_ENTRIES = 200
+
+// Stored text is kept short; each row clips it further to its width.
+const LOG_TEXT_MAX_CELLS = 120
+
+const MAIN_LOG_NAME = 'Claude'
+
+const YOU_LOG_NAME = 'you'
+
+const SESSION_LOG_NAME = 'session'
+
+// An agent the list has not named yet.
+const UNNAMED_AGENT_LOG_NAME = 'agent'
+
+const CLOCK_SEPARATOR = ':'
+
+const END_WORDS: Record<DashLogTone, string> = {
+  plain: 'ended after',
+  done: 'done in',
+  failed: 'failed after',
+  stopped: 'stopped after',
+}
+
+const TURN_END_LOG: Record<DashTurnEnd['reason'], { tone: DashLogTone; word: string }> = {
+  answer: { tone: 'done', word: 'replied in' },
+  aborted: { tone: 'stopped', word: 'interrupted after' },
+  refusal: { tone: 'failed', word: 'refused after' },
+  error: { tone: 'failed', word: 'ended with an error after' },
+}
+
+export type LogActor = { source: DashLogSource; who: string }
+
+export type LogLine = LogActor & { at: number; text: string; tone: DashLogTone }
+
+export const MAIN_ACTOR: LogActor = { source: 'main', who: MAIN_LOG_NAME }
+
+export const SESSION_ACTOR: LogActor = { source: 'session', who: SESSION_LOG_NAME }
+
+// Returns the log itself when there is nothing to add, so a caller can skip
+// the write.
+export function withLogLines(log: DashLogEntry[], lines: readonly LogLine[]): DashLogEntry[] {
+  if (lines.length === 0) {
+    return log
+  }
+
+  const lastSeq = log[log.length - 1]?.seq ?? 0
+  const added = lines.map((line, index) => ({ ...line, text: clipCells(line.text, LOG_TEXT_MAX_CELLS), seq: lastSeq + index + 1 }))
+
+  return [...log, ...added].slice(-LOG_MAX_ENTRIES)
+}
+
+function agentSource(isTeammate: boolean): DashLogSource {
+  return isTeammate ? 'teammate' : 'subagent'
+}
+
+// The main conversation for no agent id; an agent by the name the list
+// gives it, or before the list names it, the name its spawn gave it.
+export function agentActor(agents: readonly DashAgent[], spawns: DashSpawns, agentId: string | undefined): LogActor {
+  if (agentId === undefined) {
+    return MAIN_ACTOR
+  }
+
+  const agent = agents.find(one => one.id === agentId)
+
+  if (agent !== undefined) {
+    return { source: agentSource(agent.isTeammate), who: agent.label }
+  }
+
+  const spawn = spawns[agentId]
+
+  return spawn === undefined ? { source: 'subagent', who: UNNAMED_AGENT_LOG_NAME } : spawnActor(spawn.name, spawn.isTeammate)
+}
+
+export function spawnActor(name: string, isTeammate: boolean): LogActor {
+  return { source: agentSource(isTeammate), who: name }
+}
+
+// A teammate's address is `<name>@<team>`, and its name there is the one the
+// team gave it: a name the team already had gets a suffix (`scout-2`).
+const TEAMMATE_ADDRESS_SEPARATOR = '@'
+
+export function spawnedName(name: string | undefined, subagentType: string, teammateId: string | undefined): string {
+  const at = teammateId?.lastIndexOf(TEAMMATE_ADDRESS_SEPARATOR) ?? -1
+
+  if (teammateId !== undefined && at > 0) {
+    return teammateId.slice(0, at)
+  }
+
+  return name ?? subagentType
+}
+
+export function taskActor(task: DashTask): LogActor {
+  return { source: 'task', who: task.kind }
+}
+
+export function startedText(description: string): string {
+  return `started: ${description}`
+}
+
+// A subagent resumed, or a teammate brought back from disk.
+export function resumedText(description: string): string {
+  return `resumed: ${description}`
+}
+
+export function endedText(tone: DashLogTone, ms: number, description: string): string {
+  return `${END_WORDS[tone]} ${formatDuration(ms)}: ${description}`
+}
+
+// How a call that did not go through ended: a hook refused it, the person
+// interrupted it, the person turned down an asking tool (a question or a
+// plan), or the tool reported an error.
+export type CallOutcome = 'denied' | 'interrupted' | 'declined' | 'failed'
+
+const CALL_OUTCOME_TONES: Record<CallOutcome, DashLogTone> = {
+  denied: 'stopped',
+  interrupted: 'stopped',
+  declined: 'stopped',
+  failed: 'failed',
+}
+
+export function callOutcomeTone(outcome: CallOutcome): DashLogTone {
+  return CALL_OUTCOME_TONES[outcome]
+}
+
+export function callEndedText(outcome: CallOutcome, activity: string): string {
+  return `${outcome}: ${activity}`
+}
+
+// The person's own prompt, by its first line; null for one with no text.
+export function promptLine(text: string, at: number): LogLine | null {
+  const line = firstLine(text)
+
+  return line === '' ? null : { source: 'you', who: YOU_LOG_NAME, at, text: line, tone: 'plain' }
+}
+
+export function turnEndLine(end: DashTurnEnd): LogLine {
+  const { tone, word } = TURN_END_LOG[end.reason]
+  const clauses = [`${word} ${formatDuration(end.durationMs)}`, ...(end.reason === 'answer' ? turnEndWork(end) : [])]
+
+  return { ...MAIN_ACTOR, at: end.endedAt, text: clauses.join(CLAUSE_JOINER), tone }
+}
+
+function agentEndLine(agent: DashAgent, tone: DashLogTone, now: number): LogLine {
+  const text = endedText(tone, now - agent.firstSeenAt, agent.description)
+
+  return { source: agentSource(agent.isTeammate), who: agent.label, at: now, text, tone }
+}
+
+// Each agent's end once: one the last list had active and this one names as
+// ended, or no longer names at all; and one a spawn recorded (`spawned`)
+// that this list is the first to name, already ended.
+export function agentEndLines(
+  previous: readonly DashAgent[],
+  next: readonly DashAgent[],
+  spawned: ReadonlySet<string>,
+  now: number,
+): LogLine[] {
+  const before = new Map(previous.map(agent => [agent.id, agent]))
+  const listed = new Set(next.map(agent => agent.id))
+
+  const ended = next.flatMap(agent => {
+    const tone = END_TONES.get(agent.status)
+    const was = before.get(agent.id)
+    const isEnding = was === undefined ? spawned.has(agent.id) : isAgentActive(was.status)
+
+    return tone === undefined || !isEnding ? [] : [agentEndLine(agent, tone, now)]
+  })
+
+  const left = previous.flatMap(agent =>
+    !listed.has(agent.id) && isAgentActive(agent.status) ? [agentEndLine(agent, 'plain', now)] : [],
+  )
+
+  return [...ended, ...left]
+}
+
+export function taskEndLine(task: DashTask, tone: DashLogTone, at: number): LogLine {
+  return { ...taskActor(task), at, text: endedText(tone, at - task.startedAt, task.description), tone }
+}
+
+// The tasks in `before` that `after` no longer holds.
+export function droppedTasks(before: readonly DashTask[], after: readonly DashTask[]): DashTask[] {
+  const kept = new Set(after.map(task => task.id))
+
+  return before.filter(task => !kept.has(task.id))
+}
+
+// Local wall-clock time of an entry.
+export function clockText(at: number, hasSeconds: boolean): string {
+  const date = new Date(at)
+  const parts = [date.getHours(), date.getMinutes(), ...(hasSeconds ? [date.getSeconds()] : [])]
+
+  return parts.map(twoDigits).join(CLOCK_SEPARATOR)
+}
+
+// newer and older: the entries below and above the window.
+export type LogWindow = { entries: DashLogEntry[]; newer: number; older: number }
+
+// The index of the window's last entry: the newest at or before the anchor,
+// never so high in the log that the window would show fewer rows than it has.
+function windowBottom(log: readonly DashLogEntry[], anchor: number | null, rows: number): number {
+  const lowest = Math.min(rows, log.length) - 1
+
+  if (anchor === null) {
+    return log.length - 1
+  }
+
+  let bottom = -1
+
+  for (const [index, entry] of log.entries()) {
+    if (entry.seq <= anchor) {
+      bottom = index
+    }
+  }
+
+  return Math.max(lowest, bottom)
+}
+
+export function logWindow(log: readonly DashLogEntry[], anchor: number | null, rows: number): LogWindow {
+  const bottom = windowBottom(log, anchor, rows)
+  const top = Math.max(0, bottom - rows + 1)
+
+  return { entries: log.slice(top, bottom + 1), newer: log.length - 1 - bottom, older: top }
+}
+
+// Where the anchor goes after the person scrolls `by` rows (negative toward
+// older entries); null once the window reaches the newest, so it follows again.
+export function scrolledAnchor(log: readonly DashLogEntry[], anchor: number | null, rows: number, by: number): number | null {
+  const lowest = Math.min(rows, log.length) - 1
+  const bottom = Math.min(log.length - 1, Math.max(lowest, windowBottom(log, anchor, rows) + by))
+
+  return bottom >= log.length - 1 ? null : (log[bottom]?.seq ?? null)
+}
+
+// What `ui.scroll` tells of a move: the window's first row after it, the
+// rows asked for, and the window's and tree's heights.
+export type ScrollMove = { offset: number; by: number; bodyRows: number; contentRows: number }
+
+// The window's first row as the move starts. `offset` is that row plus `by`,
+// clamped to the tree, so it is exact unless the clamp cut the move short;
+// then it started between the edge and `by` rows from it, and `lastRead`, the
+// offset the last drawing read, picks the row within that span.
+export function rowBeforeMove(move: ScrollMove, lastRead: number): number {
+  const last = Math.max(0, move.contentRows - move.bodyRows)
+
+  if (move.by < 0 && move.offset === 0) {
+    return Math.min(Math.max(0, lastRead), Math.min(last, -move.by))
+  }
+
+  if (move.by > 0 && move.offset === last) {
+    return Math.min(last, Math.max(lastRead, last - move.by, 0))
+  }
+
+  return move.offset - move.by
+}
+
+export type SplitCells = { first: string; second: string }
+
+// One bar split in two by `firstPercent`, each part drawn in full blocks.
+export function splitCells(firstPercent: number, cells: number): SplitCells {
+  const first = Math.min(cells, Math.max(0, Math.round((firstPercent * cells) / PERCENT_FULL)))
+
+  return { first: FULL_BLOCK.repeat(first), second: FULL_BLOCK.repeat(cells - first) }
 }
 
 function activeFirst(a: WorkerView, b: WorkerView): number {

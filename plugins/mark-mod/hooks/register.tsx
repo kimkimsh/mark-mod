@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface, ToolCallInput, ToolCallResult, UiScrollInput } from 'claude-code'
 
 import type {
   DashAgent,
@@ -8,29 +8,48 @@ import type {
   DashAgentWorks,
   DashCall,
   DashCounts,
+  DashLogTone,
+  DashSpawns,
   DashTask,
   DashTokens,
   DashUsage,
 } from '../types'
 import {
+  SESSION_ACTOR,
   activityOf,
   addTokens,
+  agentActor,
+  agentEndLines,
   agentsFromReading,
   buildView,
+  callEndedText,
+  callOutcomeTone,
+  droppedTasks,
   editPathField,
   effortLabel,
   emptyTokens,
-  endedTaskIds,
+  endedTasks,
   isAgentActive,
   isAskingTool,
   isTaskOver,
   isTokensEmpty,
   livePaneIds,
+  logWindow,
   newTurn,
   paneListingArgv,
   paneRosterFromText,
+  promptLine,
+  resumedText,
   rosterPath,
+  rowBeforeMove,
+  scrolledAnchor,
+  spawnActor,
+  spawnedName,
+  startedText,
+  taskActor,
+  taskEndLine,
   tasksStillRead,
+  turnEndLine,
   usageFromReading,
   withAgentActivity,
   withAgentCallEnded,
@@ -38,6 +57,7 @@ import {
   withAnsweredModel,
   withEdit,
   withKnownLimits,
+  withLogLines,
   withRequest,
   withSpawn,
   withSpawnModel,
@@ -48,7 +68,19 @@ import {
   withoutTask,
   withoutTasks,
 } from './model'
-import type { AgentReading, DashSnapshot, PaneRoster, TaskReading, ToolArgs, UsageCounts, UsageReading } from './model'
+import type {
+  AgentReading,
+  CallOutcome,
+  DashSnapshot,
+  LogActor,
+  LogLine,
+  PaneCheck,
+  PaneRoster,
+  TaskReading,
+  ToolArgs,
+  UsageCounts,
+  UsageReading,
+} from './model'
 import { bandTree, paneTree } from './view'
 
 const PANE_ID = 'mark-mod'
@@ -108,6 +140,29 @@ const compactionsAtom = atom({ plugin: 'mark-mod', key: 'compactions' } as const
 // closed. A fresh process starts it false, so a new session opens the pane.
 const paneClosedAtom = atom({ plugin: 'mark-mod', key: 'paneClosed' } as const, false)
 
+const logAtom = atom({ plugin: 'mark-mod', key: 'activityLog' } as const, [])
+
+const logAnchorAtom = atom({ plugin: 'mark-mod', key: 'logAnchor' } as const, null)
+
+const spawnsAtom = atom({ plugin: 'mark-mod', key: 'spawns' } as const, {})
+
+const endingTasksAtom = atom({ plugin: 'mark-mod', key: 'endingTasks' } as const, [])
+
+const COMPACTED_TEXT = 'compacted the conversation'
+
+// A pane drawing, for the scroll hook: its body's rows, the tree row its log
+// starts at, how many entries the log shows, and the window offset it read.
+type PaneLayout = { bodyRows: number; logTop: number; logRows: number; offset: number }
+
+// One per surface the pane is drawn on, each its own size. `ui.scroll` names
+// no surface, so a move is matched to a drawing by its body's rows.
+const paneLayouts = new Map<RenderSurface, PaneLayout>()
+
+// The engine's word on whether a main turn runs, as the band's props last
+// carried it; null before the band is drawn. The pane has no such prop, and
+// the turn record may have missed a turn's end.
+let engineIsWorking: boolean | null = null
+
 type SavedSession = { tokens: DashTokens; savedAt: number }
 
 // The last usage written, kept outside $.state: after a /clear the session's
@@ -123,6 +178,81 @@ async function writeUsage($: EngineInterface, reading: UsageReading): Promise<vo
   if (JSON.stringify(usage) !== JSON.stringify(previous)) {
     await update($, usageAtom, () => usage)
   }
+}
+
+function fewestLogRows(): number | null {
+  const rows = [...paneLayouts.values()].map(layout => layout.logRows)
+
+  return rows.length === 0 ? null : Math.min(...rows)
+}
+
+// A held window that shows the newest entry anyway, as after the log card
+// grew, follows again before more arrive; otherwise they would collect below
+// a window the person never scrolled at its new size.
+async function releaseShownAnchor($: EngineInterface): Promise<void> {
+  const anchor = await read($, logAnchorAtom)
+  const rows = fewestLogRows()
+
+  if (anchor !== null && rows !== null && logWindow(await read($, logAtom), anchor, rows).newer === 0) {
+    await update($, logAnchorAtom, () => null)
+  }
+}
+
+async function appendLog($: EngineInterface, lines: readonly LogLine[]): Promise<void> {
+  if (lines.length > 0) {
+    await releaseShownAnchor($)
+    await update($, logAtom, log => withLogLines(log, lines))
+  }
+}
+
+async function logAs($: EngineInterface, actor: LogActor, text: string, tone: DashLogTone): Promise<void> {
+  await appendLog($, [{ ...actor, at: await $.clock.now(), text, tone }])
+}
+
+// Removes tasks and logs each one that went, with the tone `toneOf` gives
+// it. The list of those gone is taken from the update that wrote, so a task
+// another hook removed meanwhile is not logged twice.
+async function dropTasks(
+  $: EngineInterface,
+  remove: (tasks: DashTask[]) => DashTask[],
+  toneOf: (task: DashTask) => DashLogTone,
+): Promise<void> {
+  const now = await $.clock.now()
+  let dropped: DashTask[] = []
+
+  await update($, tasksAtom, tasks => {
+    const kept = remove(tasks)
+    dropped = droppedTasks(tasks, kept)
+
+    return kept
+  })
+
+  await appendLog(
+    $,
+    dropped.map(task => taskEndLine(task, toneOf(task), now)),
+  )
+}
+
+// dropTasks for the tasks waiting on their notification.
+async function dropEndingTasks(
+  $: EngineInterface,
+  remove: (tasks: DashTask[]) => DashTask[],
+  toneOf: (task: DashTask) => DashLogTone,
+): Promise<void> {
+  const now = await $.clock.now()
+  let dropped: DashTask[] = []
+
+  await update($, endingTasksAtom, tasks => {
+    const kept = remove(tasks)
+    dropped = droppedTasks(tasks, kept)
+
+    return kept
+  })
+
+  await appendLog(
+    $,
+    dropped.map(task => taskEndLine(task, toneOf(task), now)),
+  )
 }
 
 const COUNT_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite']
@@ -254,21 +384,22 @@ async function listPanes($: EngineInterface, argv: readonly string[]): Promise<s
   }
 }
 
-// The working pane teammates whose pane is gone or dead, by teammateId; one
-// roster read and one tmux call per team, and none while no pane teammate
-// works.
-async function endedPaneTeammates($: EngineInterface, agents: readonly AgentReading[]): Promise<Set<string>> {
+// The working pane teammates whose pane is gone or dead, and those tmux could
+// not be asked about; one roster read and one tmux call per team, and none
+// while no pane teammate works.
+async function checkPanes($: EngineInterface, agents: readonly AgentReading[]): Promise<PaneCheck> {
   const ended = new Set<string>()
+  const unchecked = new Set<string>()
   const working = agents.flatMap(agent => (agent.teammateId !== undefined && isAgentActive(agent.status) ? [agent.teammateId] : []))
 
   if (working.length === 0) {
-    return ended
+    return { ended, unchecked }
   }
 
   const dir = await configDir($)
 
   if (dir === null) {
-    return ended
+    return { ended, unchecked }
   }
 
   const tmuxEnv = await $.env.get('TMUX')
@@ -296,6 +427,10 @@ async function endedPaneTeammates($: EngineInterface, agents: readonly AgentRead
     const listing = await listPanes($, argv)
 
     if (listing === null) {
+      for (const pane of panes) {
+        unchecked.add(pane.teammateId)
+      }
+
       continue
     }
 
@@ -308,7 +443,7 @@ async function endedPaneTeammates($: EngineInterface, agents: readonly AgentRead
     }
   }
 
-  return ended
+  return { ended, unchecked }
 }
 
 // The only writer of `live`, of `usage` from the engine's reading, of a
@@ -318,7 +453,11 @@ async function refreshLive($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
 
   if ((await read($, tasksAtom)).some(task => isTaskOver(task, now))) {
-    await update($, tasksAtom, tasks => tasks.filter(task => !isTaskOver(task, now)))
+    await dropTasks(
+      $,
+      tasks => tasks.filter(task => !isTaskOver(task, now)),
+      () => 'plain',
+    )
   }
 
   let listed: Awaited<ReturnType<EngineInterface['agent']['list']>> | null = null
@@ -331,9 +470,12 @@ async function refreshLive($: EngineInterface): Promise<void> {
     listError = errorText(cause)
   }
 
-  const readings = listed === null ? null : withEndedPanes(listed, await endedPaneTeammates($, listed))
   const previous = await read($, liveAtom)
+  const endedBefore = new Set(previous.agents.flatMap(agent => (agent.status === 'killed' ? [agent.id] : [])))
+  const readings = listed === null ? null : withEndedPanes(listed, await checkPanes($, listed), endedBefore)
   const agents = readings === null ? previous.agents : agentsFromReading(readings, previous.agents, now)
+  const spawned = new Set(Object.keys(await read($, spawnsAtom)))
+  await appendLog($, agentEndLines(previous.agents, agents, spawned, now))
 
   // Only an agent the list named and no longer does: a teammate's model is
   // recorded at its spawn, which may come before the list names it.
@@ -342,6 +484,7 @@ async function refreshLive($: EngineInterface): Promise<void> {
     const gone = previous.agents.filter(agent => !listedIds.has(agent.id)).map(agent => agent.id)
     await changeAgentModels($, models => withoutAgentEntries(models, gone))
     await changeAgentWork($, work => withoutAgentEntries(work, gone))
+    await changeSpawns($, spawns => withoutAgentEntries(spawns, gone))
   }
 
   const clock = (await isAnythingRunning($, agents)) ? now : now - (now % IDLE_CLOCK_STEP_MS)
@@ -370,18 +513,25 @@ async function drainRefreshes($: EngineInterface): Promise<void> {
 }
 
 // One pull at a time: the ticker and the event hooks both ask, and a slow
-// $.agent.list() answered after a newer one must not overwrite it. Hooks
-// never await this, so a slow list cannot hold up a turn.
-function requestRefresh($: EngineInterface): void {
+// $.agent.list() answered after a newer one must not overwrite it. The
+// promise settles once the pulls asked so far have run.
+function sharedRefresh($: EngineInterface): Promise<void> {
   if (refreshInFlight !== null) {
     isRefreshQueued = true
 
-    return
+    return refreshInFlight
   }
 
   refreshInFlight = drainRefreshes($).finally(() => {
     refreshInFlight = null
   })
+
+  return refreshInFlight
+}
+
+// Event hooks never await a pull, so a slow list cannot hold up a turn.
+function requestRefresh($: EngineInterface): void {
+  void sharedRefresh($)
 }
 
 // A tool's arguments ride beside the envelope's own keys; only a string is
@@ -402,7 +552,10 @@ function toolArgs(e: ToolCallInput): ToolArgs {
   }
 }
 
-async function addCall($: EngineInterface, e: ToolCallInput): Promise<DashCall> {
+// The call, and who it is logged under (null: not logged).
+type StartedCall = { call: DashCall; actor: LogActor | null }
+
+async function addCall($: EngineInterface, e: ToolCallInput): Promise<StartedCall> {
   const call: DashCall = {
     id: e.tool_use_id,
     tool: e.tool,
@@ -415,14 +568,24 @@ async function addCall($: EngineInterface, e: ToolCallInput): Promise<DashCall> 
   }
 
   const { agentId } = e
+  const isTracked = agentId === undefined || (await isTrackedAgent($, agentId))
 
   if (agentId === undefined) {
     await update($, turnAtom, turn => (turn === null ? turn : { ...turn, calls: [...turn.calls, call] }))
-  } else if (await isTrackedAgent($, agentId)) {
+  } else if (isTracked) {
     await update($, agentWorkAtom, work => withAgentActivity(work, agentId, call.id, call.activity))
   }
 
-  return call
+  // The main conversation, or an agent the list names or a spawn recorded. A
+  // workflow's agents and the engine's forks are not logged; their calls
+  // would read as some agent's with no name.
+  const actor = isTracked ? agentActor((await read($, liveAtom)).agents, await read($, spawnsAtom), agentId) : null
+
+  if (actor !== null) {
+    await appendLog($, [{ ...actor, at: call.startedAt, text: call.activity, tone: 'plain' }])
+  }
+
+  return { call, actor }
 }
 
 // An edit that went through: the reply's receipt counts the files it changed.
@@ -448,6 +611,21 @@ async function removeCall($: EngineInterface, call: DashCall, agentId: string | 
   }
 }
 
+// isError covers a throw, an interrupt and an error answer alike; the
+// dispatch's signal aborts on the person's interrupt, and an asking tool
+// errs when the person turns it down.
+function callOutcome(ran: ToolCallResult, call: DashCall, isAborted: boolean): CallOutcome {
+  if (ran.deny !== undefined) {
+    return 'denied'
+  }
+
+  if (isAborted) {
+    return 'interrupted'
+  }
+
+  return isAskingTool(call.tool) ? 'declined' : 'failed'
+}
+
 function isAnswered<R extends { deny?: string; isError?: true }>(
   ran: R,
 ): ran is Exclude<R, { deny: string } | { isError: true }> {
@@ -464,6 +642,7 @@ async function addTask(
   const startedAt = await $.clock.now()
   const task: DashTask = { id, kind, description, startedAt, endsBy: runsForMs === null ? null : startedAt + runsForMs }
   await update($, tasksAtom, tasks => withTask(tasks, task))
+  await logAs($, taskActor(task), startedText(description), 'plain')
 }
 
 async function addStepUsage($: EngineInterface, usage: UsageCounts, isMainLoop: boolean): Promise<void> {
@@ -490,6 +669,14 @@ async function changeAgentWork($: EngineInterface, change: (work: DashAgentWorks
 
   if (change(work) !== work) {
     await update($, agentWorkAtom, change)
+  }
+}
+
+async function changeSpawns($: EngineInterface, change: (spawns: DashSpawns) => DashSpawns): Promise<void> {
+  const spawns = await read($, spawnsAtom)
+
+  if (change(spawns) !== spawns) {
+    await update($, spawnsAtom, change)
   }
 }
 
@@ -524,14 +711,47 @@ async function reconcileTasks($: EngineInterface, readings: readonly TaskReading
     return
   }
 
-  await update($, tasksAtom, tasks => tasksStillRead(tasks, readings))
+  // A task the last Stop took down that no notification has ended since
+  // ends here, with nothing to say how.
+  await dropEndingTasks(
+    $,
+    () => [],
+    () => 'plain',
+  )
+
+  // A task this snapshot no longer lists has ended, and its notification,
+  // which says how, usually follows the turn: it waits for it.
+  let dropped: DashTask[] = []
+
+  await update($, tasksAtom, tasks => {
+    const kept = tasksStillRead(tasks, readings)
+    dropped = droppedTasks(tasks, kept)
+
+    return kept
+  })
+
+  if (dropped.length > 0) {
+    await update($, endingTasksAtom, ending => [...ending, ...dropped])
+  }
 }
 
 // What the turn record says; the band replaces isWorking with the engine's
 // own AbovePrompt prop.
 async function snapshotOf($: EngineInterface): Promise<DashSnapshot> {
-  const [turn, asks, tasks, tokens, hasResponse, lastTurn, usage, live, agentModels, agentWork, mainModel, compactions] =
-    await Promise.all([
+  const [
+    turn,
+    asks,
+    tasks,
+    tokens,
+    hasResponse,
+    lastTurn,
+    usage,
+    live,
+    agentModels,
+    agentWork,
+    mainModel,
+    compactions,
+  ] = await Promise.all([
       read($, turnAtom),
       read($, asksAtom),
       read($, tasksAtom),
@@ -591,13 +811,39 @@ async function resetConversation($: EngineInterface): Promise<void> {
   await update($, agentModelsAtom, () => ({}))
   await update($, agentWorkAtom, () => ({}))
   await update($, compactionsAtom, () => 0)
+  await update($, logAtom, () => [])
+  await update($, logAnchorAtom, () => null)
+  await update($, spawnsAtom, () => ({}))
   await update($, usageAtom, usage => (usage === null ? usage : withoutConversation(usage)))
+}
+
+// The drawing a move is over: the one whose body has the move's rows.
+function layoutOf(e: UiScrollInput): PaneLayout | undefined {
+  return [...paneLayouts.values()].find(layout => layout.bodyRows === e.bodyRows)
+}
+
+// A tree that fits the body leaves the engine nothing to scroll, so every
+// move is the log's. One taller than the body (a short terminal) scrolls as
+// usual, except under the pointer over the log.
+function isOverLog(e: UiScrollInput, layout: PaneLayout): boolean {
+  if (e.contentRows <= e.bodyRows) {
+    return true
+  }
+
+  return e.pointer !== undefined && rowBeforeMove(e, layout.offset) + e.pointer.row >= layout.logTop
+}
+
+// A key's move is sized for the body: a page key moves `bodyRows`, Home and
+// End `contentRows`, which in a tree that fits are the same. Either moves the
+// log one window; a wheel tick moves it its own rows.
+function logRowsMoved(e: UiScrollInput, layout: PaneLayout): number {
+  return e.pointer === undefined && Math.abs(e.by) >= e.bodyRows ? Math.sign(e.by) * layout.logRows : e.by
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: COMMAND, description: 'Open or close the session dashboard pane' })
-    await refreshLive($)
+    await sharedRefresh($)
     $.clock.every(TICK_MS, () => {
       requestRefresh($)
     })
@@ -696,8 +942,12 @@ export const register: Register = on => {
 
     // A workflow's agent never enters the list, so nothing is kept for it.
     if (agentId !== undefined && e.workflow === undefined) {
+      const spawn = { name: spawnedName(e.name, e.subagentType, started.teammateId), isTeammate: started.teammateId !== undefined }
       await changeAgentModels($, models => withSpawnModel(models, agentId, model))
       await update($, turnAtom, turn => withSpawn(turn, agentId, e.parentAgentId, started.teammateId === undefined))
+      await update($, spawnsAtom, spawns => ({ ...spawns, [agentId]: spawn }))
+      const text = e.resume === undefined ? startedText(e.description) : resumedText(e.description)
+      await logAs($, spawnActor(spawn.name, spawn.isTeammate), text, 'plain')
     }
 
     return started
@@ -709,13 +959,17 @@ export const register: Register = on => {
       const turn = await read($, turnAtom)
       await update($, turnAtom, () => null)
       await update($, asksAtom, () => [])
-      await update($, lastTurnAtom, () => ({
+
+      const end = {
         reason: e.reason,
         endedAt,
         durationMs: e.durationMs,
         editedFiles: turn?.editedPaths.length ?? 0,
         subagentsStarted: turn?.agentIds.length ?? 0,
-      }))
+      }
+
+      await update($, lastTurnAtom, () => end)
+      await appendLog($, [turnEndLine(end)])
     }
 
     void queueSave($, await $.session.id())
@@ -724,14 +978,19 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A call that went through is its start's entry alone; one that did not
+  // adds how it ended.
   on('tool.call', async ($, e, next) => {
-    const call = await addCall($, e)
+    const { call, actor } = await addCall($, e)
 
     try {
       const ran = await next(e)
 
       if (isAnswered(ran)) {
         await recordEdit($, e)
+      } else if (actor !== null) {
+        const outcome = callOutcome(ran, call, next.signal.aborted)
+        await logAs($, actor, callEndedText(outcome, call.activity), callOutcomeTone(outcome))
       }
 
       return ran
@@ -799,7 +1058,11 @@ export const register: Register = on => {
 
     if (isAnswered(ran)) {
       const stopped = ran.result.task_id
-      await update($, tasksAtom, tasks => withoutTask(tasks, stopped))
+      await dropTasks(
+        $,
+        tasks => withoutTask(tasks, stopped),
+        () => 'stopped',
+      )
     }
 
     requestRefresh($)
@@ -811,9 +1074,26 @@ export const register: Register = on => {
     const entered = await next(e)
 
     if (e.origin.kind === 'task-notification') {
-      const ended = endedTaskIds(e.text)
-      await update($, tasksAtom, tasks => withoutTasks(tasks, ended))
+      const ended = new Map(endedTasks(e.text).map(task => [task.id, task.tone]))
+      await dropTasks(
+        $,
+        tasks => withoutTasks(tasks, [...ended.keys()]),
+        task => ended.get(task.id) ?? 'plain',
+      )
+      await dropEndingTasks(
+        $,
+        tasks => withoutTasks(tasks, [...ended.keys()]),
+        task => ended.get(task.id) ?? 'plain',
+      )
       requestRefresh($)
+    }
+
+    // The person's own words, typed here or sent from the Remote Control
+    // bridge, once no hook dropped them.
+    const line = promptLine(e.text, await $.clock.now())
+
+    if ((e.origin.kind === 'composer' || e.origin.kind === 'bridge') && entered.drop === undefined && line !== null) {
+      await appendLog($, [line])
     }
 
     return entered
@@ -855,6 +1135,7 @@ export const register: Register = on => {
 
     if (e.agentId === undefined && e.trigger !== 'precompute' && compacted.messages !== undefined) {
       await update($, compactionsAtom, count => count + 1)
+      await logAs($, SESSION_ACTOR, COMPACTED_TEXT, 'plain')
     }
 
     return compacted
@@ -879,6 +1160,12 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // The pane's state follows the engine's word too, drawn again once it moves.
+    if (e.props.isWorking !== engineIsWorking) {
+      engineIsWorking = e.props.isWorking
+      $.ui.invalidate('ui.render')
+    }
+
     if (e.props.hasSurvey) {
       return next(e)
     }
@@ -905,8 +1192,33 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const view = buildView(await snapshotOf($))
+    const snapshot = await snapshotOf($)
+    const view = buildView({ ...snapshot, isWorking: engineIsWorking ?? snapshot.isWorking })
+    const log = { entries: await read($, logAtom), anchor: await read($, logAnchorAtom) }
+    const { scroll } = e.props
+    const frame = { columns: e.props.bodyColumns, bodyRows: scroll.bodyRows, isDocked: e.props.placement === 'dock' }
+    const drawing = paneTree($.ui.resolve(e), view, log, frame)
+    paneLayouts.set(e.surface, { bodyRows: scroll.bodyRows, logTop: drawing.logTop, logRows: drawing.logRows, offset: scroll.offset })
 
-    return paneTree($.ui.resolve(e), view, e.props.bodyColumns)
+    return drawing.tree
+  })
+
+  // The log scrolls itself: the window over it moves by the person's rows,
+  // and the engine's window over the body stays where it is.
+  on('ui.scroll', { requestId: PANE_ID }, async ($, e, next) => {
+    const layout = layoutOf(e)
+
+    if (e.component !== 'Pane' || layout === undefined || !isOverLog(e, layout)) {
+      return next(e)
+    }
+
+    const anchor = await read($, logAnchorAtom)
+    const moved = scrolledAnchor(await read($, logAtom), anchor, layout.logRows, logRowsMoved(e, layout))
+
+    if (moved !== anchor) {
+      await update($, logAnchorAtom, () => moved)
+    }
+
+    return {}
   })
 }
