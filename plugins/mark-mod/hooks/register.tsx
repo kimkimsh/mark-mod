@@ -1,5 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register, RenderSurface, ToolCallInput, ToolCallResult, UiScrollInput } from 'claude-code'
+import type {
+  CommandRunResult,
+  Elements,
+  EngineInterface,
+  Register,
+  RenderSurface,
+  ToolCallInput,
+  ToolCallResult,
+  UiScrollInput,
+} from 'claude-code'
 
 import type {
   DashAgent,
@@ -97,6 +106,10 @@ const DIFF_COMMAND = 'diff'
 const DIFF_WAITS_TEXT = `/${DIFF_COMMAND} runs once Claude finishes this turn`
 
 const DIFF_ALREADY_WAITS_TEXT = `/${DIFF_COMMAND} is already waiting for this turn to finish`
+
+const DIFF_SEND_TEXT = `The changes panel did not come up from the button; press Enter to send /${DIFF_COMMAND} yourself`
+
+const DIFF_TYPE_TEXT = `The changes panel did not come up from the button; type /${DIFF_COMMAND} yourself`
 
 const BEHIND_TEXT = `The session pane is behind another pane; its ${PANE_TITLE} tab shows it`
 
@@ -860,13 +873,30 @@ async function pressDash($: EngineInterface): Promise<void> {
   }
 }
 
+// The engine seats a pane opened from inside another plugin's command run as
+// unasked: from 144 columns, or 110 once the person has opened it themselves.
+// Their own /diff counts as asked and is remembered, so when the button's run
+// left the session pane in front, the command goes in the prompt box for them
+// to send; a draft of theirs is never replaced.
+async function handDiffToPerson($: EngineInterface): Promise<void> {
+  if ((await $.prompt.read()).text !== '') {
+    $.ui.toast(DIFF_TYPE_TEXT)
+
+    return
+  }
+
+  const filled = await $.prompt.fill({ text: `/${DIFF_COMMAND}` })
+  $.ui.toast(filled.isFilled ? DIFF_SEND_TEXT : DIFF_TYPE_TEXT)
+}
+
 // The engine holds a plugin's command run until the turn ends, so a press
 // during a turn says so rather than seeming to do nothing, and a second press
 // in that turn is not queued behind the first.
 async function runDiff($: EngineInterface): Promise<void> {
   const turn = await read($, turnAtom)
+  const isWorking = engineIsWorking ?? turn !== null
 
-  if (engineIsWorking ?? turn !== null) {
+  if (isWorking) {
     if (turn !== null && turn.turnId === diffWaitTurnId) {
       $.ui.toast(DIFF_ALREADY_WAITS_TEXT)
 
@@ -877,10 +907,24 @@ async function runDiff($: EngineInterface): Promise<void> {
     $.ui.toast(DIFF_WAITS_TEXT)
   }
 
+  // Read only for a run the engine takes at once: a queued one starts after
+  // the person may have switched tabs.
+  const wasShown = !isWorking && (await isPaneShown($))
+  let ran: CommandRunResult
+
   try {
-    await $.command.run({ command: DIFF_COMMAND })
+    ran = await $.command.run({ command: DIFF_COMMAND })
   } catch (cause) {
     $.ui.toast(`/${DIFF_COMMAND} did not run: ${errorText(cause)}`)
+
+    return
+  }
+
+  // A shown changes panel puts its Diff tab in front of the session pane. The
+  // older sidebar covers the pane while it still reads shown, and answers no
+  // text, so only a run that answered is taken to have failed.
+  if (wasShown && ran.text !== undefined && (await isPaneShown($))) {
+    await handDiffToPerson($)
   }
 }
 
