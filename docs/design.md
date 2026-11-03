@@ -5,7 +5,8 @@
 One glance at the terminal answers: *what is Claude doing right now, what is it
 waiting on, and how much room is left?* A second look, at the pane, answers
 the follow-ups: which model, what the last reply did, which agent is doing
-what, and where the tokens went.
+what, where the tokens went, and, in its Activity log, what happened in what
+order.
 
 Shown at all times, above the prompt (the band), and in a pane that opens with
 the session (`/dash` closes and reopens it):
@@ -26,6 +27,7 @@ the session (`/dash` closes and reopens it):
 | An agent's model and effort | `agent.spawn` result `model` (resolved at spawn); each `turn.step` in the agent's loop (`e.model`, `e.effort`, `usage.model`) |
 | What an agent is doing, how full its context is | `tool.call` with that `agentId`; the input side of its latest `turn.step` `usage` |
 | Background tasks | main-loop `tool.call` results (`backgroundTaskId`, `taskId`), task-notification prompts, taken down by `classic.Stop` `background_tasks` where it runs |
+| Activity log | `prompt.submit` (origin `composer` or `bridge`, not dropped), `tool.call` start and a denied or failed result, `agent.spawn`, an agent's status leaving running in `$.agent.list()`, a background task's start and end, main-loop `turn.complete`, `session.compact` |
 
 ## States
 
@@ -168,8 +170,10 @@ band would be.
   otherwise its own (`-L claude-swarm-<lead pid>`), which exits with its last
   pane and leaves its socket file behind. A pane missing, or kept dead by the
   `remain-on-exit failed` the engine sets, shows the teammate as stopped; a
-  roster that cannot be read, or a tmux that cannot be run, leaves the list's
-  word standing.
+  roster that cannot be read leaves the list's word standing. A tmux that
+  cannot be run says nothing either way: a teammate the last refresh showed
+  stopped stays stopped, and one it did not keeps the list's word, so a
+  failing tmux call neither revives a dead pane nor ends a live one.
 - **Only the main loop's turn is the turn.** `turn.start` fires for every
   agent's turn as well, and only the main loop's `turn.complete` clears the
   turn record, so an agent's start or end never restarts or ends it.
@@ -202,6 +206,80 @@ closed. That matters because `session.start` fires again within one process
 (an enable, a worker respawn, a reload), and reopening there would undo the
 person's choice. A new process starts with the pane open. An unload never
 reaches the opener's hooks, so it is never taken for the person's close.
+
+## Activity log
+
+A list in `$.state` (`activityLog`), one entry per event, newest last: time,
+who (`you`, `Claude`, an agent's list name, a task's kind, `session`), text,
+and a tone (plain, done, failed, stopped). It keeps the last 200 entries and
+is conversation state, emptied with the rest at `/clear`.
+
+What goes in, and what does not:
+
+- The person's prompt, by its first line, only from the composer or the
+  Remote Control bridge and only when no hook dropped it. A notification, a
+  schedule or a peer's message is not the person's words.
+- A call's start, worded as the band words it. A call that went through adds
+  nothing more; one that did not adds how it ended, so a failure has a line
+  of its own to stand out. `isError` covers a throw, an interrupt and an
+  error answer alike, so the outcome is told apart by other means: a hook's
+  deny is `denied`; a dispatch whose `next.signal` aborted (the person's
+  interrupt) is `interrupted`; an asking tool (a question, a plan) that errs
+  was turned down, `declined`; anything else `failed`. A permission dialog
+  answered no is an error the hooks cannot tell from a tool's, so it reads
+  `failed`.
+- Calls of the main conversation and of agents the list names or a spawn
+  recorded (`spawns`: the name and kind the spawn gave, the teammate's name
+  as its team gave it, from `teammateId`). A workflow's agents and the
+  engine's forks carry ids no list names; their calls would read as some
+  agent's with no name, so they are left out.
+- A spawn logs `started: …`, or `resumed: …` for one that carries `resume`
+  (a subagent resumed, a teammate brought back from disk).
+- An agent's end comes from the 1 s list pull, once: an agent the last pull
+  had pending, running or waiting and this one names completed, failed or
+  killed, or no longer names at all (`ended after`); and one a spawn
+  recorded that this pull is the first to name, already ended.
+- A task's end comes from wherever the task leaves the record (its
+  notification's `<status>`, `TaskStop`, a monitor's deadline), each removal
+  logging exactly the tasks that update removed. The Stop snapshot is the
+  exception: a task it no longer lists has ended, but its notification,
+  which says how, usually follows the turn, so the task waits in
+  `endingTasks` for it; one still waiting at the next Stop ends there,
+  `ended after`.
+
+Times are the local wall clock (`Date`'s local fields, which follow the
+machine's time zone in the hooks environment).
+
+**Scrolling.** The engine scrolls a pane body taller than its rows; the log
+needs its own window instead, so new entries can keep arriving while the
+person reads older ones. Docked, the pane's tree is made exactly the body's
+height (the log card takes the rows the other cards leave, never fewer than
+4), so the engine has nothing to scroll and every `ui.scroll` is the log's:
+the hook moves the log's window and returns `{}` without `next`. A wheel
+tick moves it `e.by` rows. A scroll key's move is sized for the body (a page
+key `bodyRows`, Home and End `contentRows`, the same rows in a tree that
+fits), so a key move, one with no pointer, moves the log one window.
+
+On a body too short for the cards (the tree overflows), only a wheel tick
+over the log card is the log's; the rest scroll the body as usual. Which
+tree row the pointer is over needs the window's first row as the move
+starts: `e.offset` minus `e.by`, exact unless the clamp cut the move short,
+since the offset the last drawing read misses the engine's own moves (an
+end followed, a clamp) on the terminal.
+
+The window holds its place by an anchor, the `seq` of its bottom entry
+(`logAnchor`, null while it follows the newest), so entries arriving below
+do not move what the person is reading. It follows again once scrolled back
+to the end, or once its window shows the newest entry anyway (the log card
+grew): the anchor is released before the next entry lands. Inline, the log
+keeps to its last 6 entries.
+
+The pane is drawn on every surface the session shows, each at its own size,
+and `ui.scroll` names no surface: each drawing's rows are kept by surface,
+and a move goes to the drawing whose body has its `bodyRows`.
+
+The band reads no log, and the log is passed to the pane apart from the
+view: a drawing that reads a value is drawn again on each write of it.
 
 ## Liveness
 
@@ -239,11 +317,11 @@ is never overwritten by an earlier one. `claude --resume` continues the count
 (verified: a resumed session keeps its id). `/clear` and an in-process
 `/resume` raise `session.end` and then `classic.SessionStart` with no
 `session.start`: the ending session is saved and its conversation state
-cleared (tokens, turn record, last reply, agents' models and work,
-compactions, context and cost; rate-limit windows and the session's model
-stay), and the next session's saved total is loaded. The store keeps the 30
-most recent sessions; an entry that does not decode is dropped rather than
-trusted.
+cleared (tokens, turn record, last reply, agents' models, work and spawn
+names, compactions, the activity log and its scroll place, context and cost;
+rate-limit windows and the session's model stay), and the next session's
+saved total is loaded. The store keeps the 30 most recent sessions; an entry
+that does not decode is dropped rather than trusted.
 
 Tokens spent before the mod loaded in a session are not counted.
 
@@ -259,7 +337,8 @@ with the engine's footer):
 ```
 
 Every meter is a fuel gauge: the bar is what is **left**, the number beside it
-is the same amount. Healthy gauges are grey; warning at 40% left or when the
+is the same amount. A healthy bar is green on a quiet track, its words in the
+normal colour and its note grey; warning at 40% left or when the
 window is on pace to run out before its reset (linear projection, not before
 15 min of a 5-hour window or 2 days of a week); error with a `⚠` at 15% left.
 
@@ -280,14 +359,36 @@ only while something runs: subagents by their task, teammates by name, at most
 four items (three below 120 cells); model detail gives way first (full, family,
 none), then whole items fold into `+N more`, so no name or age is cut.
 
-Pane, top to bottom: Model, Last reply; the gauges with their notes (16-cell
-bars, 10 below 64 columns; the label column widens past its 12 cells for a
-longer limit name); Cost and Tokens (total with the main loop and every other
-loop, "agents", then input and output, then cache read and cache write); then the
-Subagents, Teammates and Background groups, each left out when empty. A
-working agent's row has a second line with its model and effort, latest
-activity and context size; finished subagents are counted in the group's
-heading (`1 running, 3 done, 1 failed`).
+Pane: a column of rounded cards, every body row a single row that truncates
+rather than wraps, so a card's height is its row count.
+
+1. **State**: the band's title (and its detail while live), Model, Last
+   reply. The border takes the state's colour unless the session is at rest
+   (done, interrupted, ready). Whether a main turn runs is the engine's
+   `isWorking`, which only the band's props carry: the band keeps the last
+   value it drew and redraws the plugin's sites when it changes, and before
+   the band is drawn the pane falls back to the turn record.
+2. **Usage**: the gauges with their notes (16-cell bars, 10 below 64
+   columns; the label column widens past its 12 cells for a longer limit
+   name), Cost, Tokens (a bar in the gauges' column split between the main
+   loop and every other loop, "agents", then the total and the two counts;
+   then input and output, then cache read and cache write). The border takes
+   the worst gauge's colour.
+3. **Agents**: the Subagents, Teammates and Background groups, each left
+   out when empty, the card with them. A working agent's row has a second
+   line with its model and effort, latest activity and context size;
+   finished subagents are counted in the group's heading (`1 running, 3
+   done, 1 failed`).
+4. **Activity**: a header (`N newer below` while held back, `N earlier
+   above` otherwise), then time (seconds dropped below 48 cells), who, an
+   outcome mark column, text.
+
+Colour is by meaning and uses theme keys only, so the light and dark themes
+both keep it readable: `claude` for the main conversation, `permission` for
+subagents, `merged` for teammates, `planMode` for background tasks (on the
+band's row 3, the pane's agent rows and the log alike); `success`,
+`warning` and `error` for gauges and outcomes; `subtle` for quiet borders
+and gauge tracks.
 
 ## Files
 

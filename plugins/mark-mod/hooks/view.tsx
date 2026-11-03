@@ -1,7 +1,19 @@
 import type { Color, Elements, RenderElement } from 'claude-code'
 
-import { BAND_LIMIT_KINDS, CLAUSE_JOINER, CONTEXT_METER_KEY, barCells, cellWidth, clipCells, worseOf } from './model'
-import type { DashView, MeterView, Phase, Severity, WorkerView } from './model'
+import type { DashLogEntry, DashLogSource, DashLogTone } from '../types'
+import {
+  BAND_LIMIT_KINDS,
+  CLAUSE_JOINER,
+  CONTEXT_METER_KEY,
+  barCells,
+  cellWidth,
+  clipCells,
+  clockText,
+  logWindow,
+  splitCells,
+  worseOf,
+} from './model'
+import type { DashView, MeterView, Phase, Severity, WorkerKind, WorkerView } from './model'
 
 export type Kit = Pick<Elements['mobile'], 'Box' | 'Text'>
 
@@ -81,11 +93,55 @@ const LOUD_PHASES = new Set<Phase>(['needs-input', 'error'])
 // A resting state's detail is history; a live one's is what is happening now.
 const LIVE_PHASES = new Set<Phase>(['needs-input', 'working'])
 
-// Healthy gauges stay grey: colour is kept for the moments that need attention.
+// Nothing runs and nothing went wrong: the pane's state card keeps a quiet
+// border. Every other state, waiting on background work included, borders
+// the card in its own colour.
+const RESTING_PHASES = new Set<Phase>(['done', 'interrupted', 'ready'])
+
+// Text beside a gauge stays grey while healthy: colour in words is kept for
+// the moments that need attention.
 const SEVERITY_COLOR: Record<Severity, Color> = {
   ok: 'inactive',
   warn: 'warning',
   danger: 'error',
+}
+
+// A gauge's fill reads as a fuel gauge: green while there is plenty left.
+const GAUGE_COLOR: Record<Severity, Color> = {
+  ok: 'success',
+  warn: 'warning',
+  danger: 'error',
+}
+
+const TRACK_COLOR: Color = 'subtle'
+
+// One hue per kind of worker, the same on the band, the pane's agent rows and
+// the activity log, so a name's colour says what it is. Theme keys, so both
+// the light and the dark theme keep them readable.
+const WORKER_COLOR: Record<WorkerKind, Color> = {
+  subagent: 'permission',
+  teammate: 'merged',
+  task: 'planMode',
+}
+
+const MAIN_COLOR: Color = 'claude'
+
+const SOURCE_COLOR: Record<DashLogSource, Color> = {
+  you: 'text',
+  main: MAIN_COLOR,
+  subagent: WORKER_COLOR.subagent,
+  teammate: WORKER_COLOR.teammate,
+  task: WORKER_COLOR.task,
+  session: 'inactive',
+}
+
+// Outcomes carry a mark in a column of their own, so a failure stands out in
+// a scrolling list; a plain step leaves the column blank.
+const TONE_STYLE: Record<DashLogTone, { mark: string; color: Color | undefined }> = {
+  plain: { mark: '  ', color: undefined },
+  done: { mark: '✓ ', color: 'success' },
+  failed: { mark: '✕ ', color: 'error' },
+  stopped: { mark: '■ ', color: 'warning' },
 }
 
 type MeterLayout = { barCells: number; noteKeys: readonly string[] }
@@ -148,8 +204,8 @@ function meterBar(kit: Kit, meter: MeterView, cells: number): RenderElement {
 
   return (
     <Text>
-      <Text color={SEVERITY_COLOR[meter.severity]}>{fill}</Text>
-      <Text dimColor>{rest}</Text>
+      <Text color={GAUGE_COLOR[meter.severity]}>{fill}</Text>
+      <Text color={TRACK_COLOR}>{rest}</Text>
     </Text>
   )
 }
@@ -347,13 +403,13 @@ function workerItemText(worker: WorkerView, detail: ModelDetail): string {
   return `${workerName(worker)}${workerModel(worker, detail)} ${worker.ageText}`
 }
 
-type WorkerGroup = { title: string; workers: WorkerView[] }
+type WorkerGroup = { kind: WorkerKind; title: string; workers: WorkerView[] }
 
 function activeGroups(view: DashView): WorkerGroup[] {
-  const groups = [
-    { title: 'Subagents', workers: view.subagents.filter(worker => worker.isActive) },
-    { title: 'Teammates', workers: view.teammates.filter(worker => worker.isActive) },
-    { title: 'Background', workers: view.tasks },
+  const groups: WorkerGroup[] = [
+    { kind: 'subagent', title: 'Subagents', workers: view.subagents.filter(worker => worker.isActive) },
+    { kind: 'teammate', title: 'Teammates', workers: view.teammates.filter(worker => worker.isActive) },
+    { kind: 'task', title: 'Background', workers: view.tasks },
   ]
 
   return groups.filter(group => group.workers.length > 0)
@@ -369,7 +425,7 @@ function shownGroups(groups: readonly WorkerGroup[], limit: number): WorkerGroup
       break
     }
 
-    shown.push({ title: group.title, workers: group.workers.slice(0, left) })
+    shown.push({ ...group, workers: group.workers.slice(0, left) })
     left -= group.workers.length
   }
 
@@ -430,7 +486,7 @@ function bandWorkers(kit: Kit, view: DashView, cells: number): RenderElement | n
       {shown.map((group, index) => (
         <Text key={group.title}>
           {index === 0 ? '' : GROUP_GAP}
-          <Text dimColor>{group.title}</Text>
+          <Text color={WORKER_COLOR[group.kind]}>{group.title}</Text>
           {group.workers.map(worker => (
             <Text key={worker.id}>
               {ITEM_GAP}
@@ -480,6 +536,82 @@ export function bandTree(
   )
 }
 
+
+const CARD_BORDER_STYLE = 'round'
+
+// A card's top and bottom border.
+const CARD_FRAME_ROWS = 2
+
+const CARD_PADDING = 1
+
+const CARD_BORDER_CELLS = 1
+
+// A card's border and padding, both sides.
+const CARD_CHROME_CELLS = 2 * (CARD_BORDER_CELLS + CARD_PADDING)
+
+// Cards at rest, and the usage card while every gauge is healthy.
+const QUIET_BORDER_COLOR: Color = 'subtle'
+
+const LOG_TITLE = 'Activity'
+
+const LOG_HEADER_ROWS = 1
+
+// Docked, the log takes the rows the other cards leave, but never fewer.
+const LOG_MIN_ROWS = 4
+
+// Inline, the pane sits above the prompt and grows with its tree.
+const LOG_INLINE_ROWS = 6
+
+const LOG_WHO_COLUMNS = 10
+
+const LOG_TIME_GAP = 2
+
+// Under this many cells across a card, times drop their seconds.
+const LOG_SECONDS_MIN_CELLS = 48
+
+const LOG_EMPTY_TEXT = 'Nothing yet.'
+
+// Each body row is a single row: everything in a card truncates rather than
+// wraps, so a card's height is its row count and the log can be sized to the
+// rows the others leave.
+type Card = { element: RenderElement; rows: number }
+
+// Where and how the pane is drawn: its body's cells and rows, and whether it
+// is docked beside the transcript (a fixed height to fill) or inline above
+// the prompt (a frame that fits the tree).
+export type PaneFrame = { columns: number; bodyRows: number; isDocked: boolean }
+
+// The activity log and where its window is held (null: at the newest). Kept
+// out of DashView: the band never shows it, and a drawing that reads a value
+// is drawn again on each write of it.
+export type PaneLog = { entries: readonly DashLogEntry[]; anchor: number | null }
+
+// logTop: the tree row the activity card starts at; logRows: how many
+// entries its window shows.
+export type PaneDrawing = { tree: RenderElement; logTop: number; logRows: number }
+
+function card(kit: Kit, key: string, border: Color, body: RenderElement[], height: number | null): Card {
+  const { Box } = kit
+  const rows = height ?? body.length + CARD_FRAME_ROWS
+
+  return {
+    rows,
+    element: (
+      <Box
+        key={key}
+        flexDirection="column"
+        flexShrink={0}
+        borderStyle={CARD_BORDER_STYLE}
+        borderColor={border}
+        paddingX={CARD_PADDING}
+        height={height ?? undefined}
+      >
+        {body}
+      </Box>
+    ),
+  }
+}
+
 function paneRow(kit: Kit, labelColumns: number, key: string, label: string, value: RenderElement): RenderElement {
   const { Box, Text } = kit
 
@@ -493,6 +625,34 @@ function paneRow(kit: Kit, labelColumns: number, key: string, label: string, val
       </Box>
     </Box>
   )
+}
+
+// The state in the band's words; the detail only while it says what is
+// happening now, since a resting state's history is the Last reply row.
+function sessionCard(kit: Kit, view: DashView, labelColumns: number): Card {
+  const { Text } = kit
+  const { phase, title, detail } = view.headline
+  const style = PHASE_STYLE[phase]
+  const isLive = LIVE_PHASES.has(phase)
+
+  const body = [
+    <Text key="state" wrap="truncate-end">
+      <Text color={style.color} bold>
+        {style.glyph} {title}
+      </Text>
+      {isLive && detail.length > 0 ? HEADLINE_GAP + detail.join(CLAUSE_JOINER) : ''}
+    </Text>,
+  ]
+
+  if (view.modelText !== null) {
+    body.push(paneRow(kit, labelColumns, 'model', 'Model', <Text wrap="truncate-end">{view.modelText}</Text>))
+  }
+
+  if (view.lastReplyText !== null) {
+    body.push(paneRow(kit, labelColumns, 'reply', 'Last reply', <Text wrap="truncate-end">{view.lastReplyText}</Text>))
+  }
+
+  return card(kit, 'session', RESTING_PHASES.has(phase) ? QUIET_BORDER_COLOR : style.color, body, null)
 }
 
 function paneMeter(kit: Kit, labelColumns: number, meter: MeterView, cells: number): RenderElement {
@@ -512,11 +672,99 @@ function paneMeter(kit: Kit, labelColumns: number, meter: MeterView, cells: numb
   )
 }
 
+// The bar sits in the gauges' column: the main conversation's share in its
+// colour, the agents' in theirs, with the legend in the same two colours.
+function tokensRow(kit: Kit, view: DashView, labelColumns: number, cells: number): RenderElement {
+  const { Text } = kit
+  const { tokens } = view
+  const split = tokens.mainPercent === null ? null : splitCells(tokens.mainPercent, cells)
+
+  return paneRow(
+    kit,
+    labelColumns,
+    'tokens',
+    'Tokens',
+    <Text wrap="truncate-end">
+      {split === null ? null : (
+        <Text>
+          <Text color={MAIN_COLOR}>{split.first}</Text>
+          <Text color={WORKER_COLOR.subagent}>{split.second}</Text>{' '}
+        </Text>
+      )}
+      {tokens.totalText}
+      {ITEM_GAP}
+      <Text color={MAIN_COLOR}>main</Text>
+      <Text dimColor>
+        {' '}
+        {tokens.mainText}
+        {CLAUSE_JOINER}
+      </Text>
+      <Text color={WORKER_COLOR.subagent}>agents</Text>
+      <Text dimColor> {tokens.agentsText}</Text>
+    </Text>,
+  )
+}
+
+// The border takes the worst gauge's colour, so a limit running low shows on
+// the card's edge too.
+function usageCard(kit: Kit, view: DashView, labelColumns: number, cells: number): Card {
+  const { Text } = kit
+  const { tokens } = view
+  const body = view.meters.map(meter => paneMeter(kit, labelColumns, meter, cells))
+  let worst: Severity = 'ok'
+
+  for (const meter of view.meters) {
+    worst = meter.leftPercent === null ? worst : worseOf(worst, meter.severity)
+  }
+
+  if (view.limitsNote !== null) {
+    body.push(
+      <Text key="limits" dimColor wrap="truncate-end">
+        {view.limitsNote}
+      </Text>,
+    )
+  }
+
+  if (tokens.costText !== null) {
+    body.push(paneRow(kit, labelColumns, 'cost', 'Cost', <Text>{tokens.costText}</Text>))
+  }
+
+  if (tokens.hasTokens) {
+    body.push(tokensRow(kit, view, labelColumns, cells))
+    body.push(
+      paneRow(
+        kit,
+        labelColumns,
+        'sent',
+        '',
+        <Text dimColor wrap="truncate-end">
+          input {tokens.inputText}
+          {CLAUSE_JOINER}output {tokens.outputText}
+        </Text>,
+      ),
+    )
+    body.push(
+      paneRow(
+        kit,
+        labelColumns,
+        'cache',
+        '',
+        <Text dimColor wrap="truncate-end">
+          cache read {tokens.cacheReadText}
+          {CLAUSE_JOINER}cache write {tokens.cacheWriteText}
+        </Text>,
+      ),
+    )
+  }
+
+  return card(kit, 'usage', worst === 'ok' ? QUIET_BORDER_COLOR : GAUGE_COLOR[worst], body, null)
+}
+
 function workerGlyph(kit: Kit, worker: WorkerView): RenderElement {
   const { Text } = kit
 
   if (worker.isActive) {
-    return <Text color="claude">●</Text>
+    return <Text color={WORKER_COLOR[worker.kind]}>●</Text>
   }
 
   return worker.isIdle ? <Text color="inactive">◦</Text> : <Text dimColor>✓</Text>
@@ -524,59 +772,44 @@ function workerGlyph(kit: Kit, worker: WorkerView): RenderElement {
 
 // Line one says which worker and for how long; line two, for a working agent,
 // what it runs on, what it did last and how full its context is.
-function paneWorker(kit: Kit, worker: WorkerView): RenderElement {
+function workerRows(kit: Kit, worker: WorkerView): RenderElement[] {
   const { Box, Text } = kit
   const isDim = !worker.isActive
   const details = [worker.modelDetailText, worker.activityText, worker.contextText].filter(text => text !== '')
 
-  return (
-    <Box key={worker.id} flexDirection="column">
-      <Box flexDirection="row">
-        <Box width={PANE_GLYPH_COLUMNS} flexShrink={0}>
-          {workerGlyph(kit, worker)}
-        </Box>
-        <Box width={PANE_WORKER_LABEL_COLUMNS} flexShrink={0}>
-          <Text dimColor={isDim} wrap="truncate-end">
-            {worker.isNested ? NESTED_MARK : ''}
-            {worker.label}
-          </Text>
-        </Box>
-        <Box flexGrow={1} flexShrink={1}>
-          <Text dimColor={isDim} wrap="truncate-end">
-            {worker.description}
-          </Text>
-        </Box>
-        <Box width={PANE_AGE_COLUMNS} flexShrink={0} justifyContent="flex-end">
-          <Text dimColor>{worker.isActive ? worker.ageText : worker.statusText}</Text>
-        </Box>
+  const rows = [
+    <Box key={worker.id} flexDirection="row">
+      <Box width={PANE_GLYPH_COLUMNS} flexShrink={0}>
+        {workerGlyph(kit, worker)}
       </Box>
-      {worker.isActive && details.length > 0 ? (
-        <Box flexDirection="row" paddingLeft={PANE_GLYPH_COLUMNS + PANE_WORKER_LABEL_COLUMNS}>
-          <Text dimColor wrap="truncate-end">
-            {details.join(ITEM_GAP)}
-          </Text>
-        </Box>
-      ) : null}
-    </Box>
-  )
-}
+      <Box width={PANE_WORKER_LABEL_COLUMNS} flexShrink={0}>
+        <Text color={isDim ? undefined : WORKER_COLOR[worker.kind]} dimColor={isDim} wrap="truncate-end">
+          {worker.isNested ? NESTED_MARK : ''}
+          {worker.label}
+        </Text>
+      </Box>
+      <Box flexGrow={1} flexShrink={1}>
+        <Text dimColor={isDim} wrap="truncate-end">
+          {worker.description}
+        </Text>
+      </Box>
+      <Box width={PANE_AGE_COLUMNS} flexShrink={0} justifyContent="flex-end">
+        <Text dimColor>{worker.isActive ? worker.ageText : worker.statusText}</Text>
+      </Box>
+    </Box>,
+  ]
 
-function paneGroup(kit: Kit, title: string, summary: string, workers: readonly WorkerView[]): RenderElement | null {
-  const { Box, Text } = kit
-
-  if (workers.length === 0 && summary === '') {
-    return null
+  if (worker.isActive && details.length > 0) {
+    rows.push(
+      <Box key={`${worker.id}:detail`} flexDirection="row" paddingLeft={PANE_GLYPH_COLUMNS + PANE_WORKER_LABEL_COLUMNS}>
+        <Text dimColor wrap="truncate-end">
+          {details.join(ITEM_GAP)}
+        </Text>
+      </Box>,
+    )
   }
 
-  return (
-    <Box key={title} flexDirection="column" marginTop={1}>
-      <Text>
-        <Text bold>{title}</Text>
-        {summary === '' ? null : <Text dimColor>{HEADLINE_GAP + summary}</Text>}
-      </Text>
-      {workers.map(worker => paneWorker(kit, worker))}
-    </Box>
-  )
+  return rows
 }
 
 function subagentSummary(view: DashView): string {
@@ -605,6 +838,104 @@ function teammateSummary(view: DashView): string {
   return `${view.activeTeammates} working${CLAUSE_JOINER}${view.idleTeammates} idle`
 }
 
+type PaneGroup = WorkerGroup & { summary: string }
+
+// A group with nothing in it is left out, and the card with it when all are.
+function agentsCard(kit: Kit, view: DashView): Card | null {
+  const { Text } = kit
+
+  const groups: PaneGroup[] = [
+    {
+      kind: 'subagent',
+      title: 'Subagents',
+      summary: subagentSummary(view),
+      workers: view.subagents.filter(worker => worker.isActive),
+    },
+    { kind: 'teammate', title: 'Teammates', summary: teammateSummary(view), workers: view.teammates },
+    {
+      kind: 'task',
+      title: 'Background',
+      summary: view.tasks.length === 0 ? '' : `${view.tasks.length} running`,
+      workers: view.tasks,
+    },
+  ]
+
+  const body = groups
+    .filter(group => group.workers.length > 0 || group.summary !== '')
+    .flatMap(group => [
+      <Text key={group.title} wrap="truncate-end">
+        <Text color={WORKER_COLOR[group.kind]} bold>
+          {group.title}
+        </Text>
+        {group.summary === '' ? null : <Text dimColor>{HEADLINE_GAP + group.summary}</Text>}
+      </Text>,
+      ...group.workers.flatMap(worker => workerRows(kit, worker)),
+    ])
+
+  return body.length === 0 ? null : card(kit, 'agents', QUIET_BORDER_COLOR, body, null)
+}
+
+function logEntryRow(kit: Kit, entry: DashLogEntry, hasSeconds: boolean): RenderElement {
+  const { Box, Text } = kit
+  const tone = TONE_STYLE[entry.tone]
+  const time = clockText(entry.at, hasSeconds)
+
+  return (
+    <Box key={String(entry.seq)} flexDirection="row">
+      <Box width={cellWidth(time) + LOG_TIME_GAP} flexShrink={0}>
+        <Text dimColor>{time}</Text>
+      </Box>
+      <Box width={LOG_WHO_COLUMNS} flexShrink={0}>
+        <Text color={SOURCE_COLOR[entry.source]} bold={entry.source === 'you'} wrap="truncate-end">
+          {entry.who}
+        </Text>
+      </Box>
+      <Box flexGrow={1} flexShrink={1}>
+        <Text wrap="truncate-end">
+          <Text color={tone.color}>{tone.mark}</Text>
+          <Text color={entry.tone === 'failed' ? tone.color : undefined}>{entry.text}</Text>
+        </Text>
+      </Box>
+    </Box>
+  )
+}
+
+// What lies outside the window: newer entries below say the log is held
+// back; earlier ones above say there is more to scroll to.
+function logNote(kit: Kit, newer: number, older: number): RenderElement | null {
+  const { Text } = kit
+
+  if (newer > 0) {
+    return <Text color="suggestion">{newer} newer below</Text>
+  }
+
+  return older > 0 ? <Text dimColor>{older} earlier above</Text> : null
+}
+
+function activityCard(kit: Kit, log: PaneLog, frame: PaneFrame, logRows: number): Card {
+  const { Box, Text } = kit
+  const window = logWindow(log.entries, log.anchor, logRows)
+  const hasSeconds = frame.columns - CARD_CHROME_CELLS >= LOG_SECONDS_MIN_CELLS
+
+  const body = [
+    <Box key="title" flexDirection="row" justifyContent="space-between">
+      <Text bold>{LOG_TITLE}</Text>
+      {logNote(kit, window.newer, window.older)}
+    </Box>,
+    ...(window.entries.length === 0
+      ? [
+          <Text key="empty" dimColor>
+            {LOG_EMPTY_TEXT}
+          </Text>,
+        ]
+      : window.entries.map(entry => logEntryRow(kit, entry, hasSeconds))),
+  ]
+
+  const height = frame.isDocked ? logRows + LOG_HEADER_ROWS + CARD_FRAME_ROWS : null
+
+  return card(kit, 'activity', QUIET_BORDER_COLOR, body, height)
+}
+
 // The usual column, or wider when a limit's name needs it.
 function paneLabelColumns(view: DashView): number {
   let columns = PANE_LABEL_COLUMNS
@@ -616,74 +947,49 @@ function paneLabelColumns(view: DashView): number {
   return columns
 }
 
-export function paneTree(kit: Kit, view: DashView, columns: number): RenderElement {
+// Docked, the tree is exactly the body's height when it can be, so the
+// engine has nothing to scroll and every wheel tick is the log's.
+function logRowsFor(frame: PaneFrame, rowsAbove: number): number {
+  if (!frame.isDocked) {
+    return LOG_INLINE_ROWS
+  }
+
+  return Math.max(LOG_MIN_ROWS, frame.bodyRows - rowsAbove - LOG_HEADER_ROWS - CARD_FRAME_ROWS)
+}
+
+export function paneTree(kit: Kit, view: DashView, log: PaneLog, frame: PaneFrame): PaneDrawing {
   const { Box, Text } = kit
-  const { tokens } = view
-  const cells = columns >= PANE_COLUMNS_WIDE ? PANE_BAR_CELLS_WIDE : PANE_BAR_CELLS_NARROW
+  const cells = frame.columns >= PANE_COLUMNS_WIDE ? PANE_BAR_CELLS_WIDE : PANE_BAR_CELLS_NARROW
   const labelColumns = paneLabelColumns(view)
 
-  return (
-    <Box flexDirection="column" width={columns}>
-      {view.listError === null ? null : (
-        <Text color="warning" wrap="truncate-end">
-          {WARNING_MARK}Can't read the agent list: {view.listError}
-        </Text>
-      )}
-      {view.modelText === null ? null : paneRow(kit, labelColumns, 'model', 'Model', <Text wrap="truncate-end">{view.modelText}</Text>)}
-      {view.lastReplyText === null
-        ? null
-        : paneRow(kit, labelColumns, 'reply', 'Last reply', <Text wrap="truncate-end">{view.lastReplyText}</Text>)}
-      <Box flexDirection="column" marginTop={view.modelText === null && view.lastReplyText === null ? 0 : 1}>
-        {view.meters.map(meter => paneMeter(kit, labelColumns, meter, cells))}
-        {view.limitsNote === null ? null : <Text dimColor>{view.limitsNote}</Text>}
-      </Box>
-      {tokens.costText === null && !tokens.hasTokens ? null : (
-        <Box flexDirection="column" marginTop={1}>
-          {tokens.costText === null ? null : paneRow(kit, labelColumns, 'cost', 'Cost', <Text>{tokens.costText}</Text>)}
-          {tokens.hasTokens
-            ? paneRow(
-                kit,
-                labelColumns,
-                'tokens',
-                'Tokens',
-                <Text wrap="truncate-end">
-                  {tokens.totalText}
-                  <Text dimColor>
-                    {ITEM_GAP}main {tokens.mainText}
-                    {CLAUSE_JOINER}agents {tokens.agentsText}
-                  </Text>
-                </Text>,
-              )
-            : null}
-          {tokens.hasTokens
-            ? paneRow(
-                kit,
-                labelColumns,
-                'sent',
-                '',
-                <Text dimColor wrap="truncate-end">
-                  input {tokens.inputText}
-                  {CLAUSE_JOINER}output {tokens.outputText}
-                </Text>,
-              )
-            : null}
-          {tokens.hasTokens
-            ? paneRow(
-                kit,
-                labelColumns,
-                'cache',
-                '',
-                <Text dimColor wrap="truncate-end">
-                  cache read {tokens.cacheReadText}
-                  {CLAUSE_JOINER}cache write {tokens.cacheWriteText}
-                </Text>,
-              )
-            : null}
-        </Box>
-      )}
-      {paneGroup(kit, 'Subagents', subagentSummary(view), view.subagents.filter(worker => worker.isActive))}
-      {paneGroup(kit, 'Teammates', teammateSummary(view), view.teammates)}
-      {paneGroup(kit, 'Background', view.tasks.length === 0 ? '' : `${view.tasks.length} running`, view.tasks)}
-    </Box>
+  const notice =
+    view.listError === null ? null : (
+      <Text key="list" color="warning" wrap="truncate-end">
+        {WARNING_MARK}Can't read the agent list: {view.listError}
+      </Text>
+    )
+
+  const cards = [sessionCard(kit, view, labelColumns), usageCard(kit, view, labelColumns, cells), agentsCard(kit, view)].filter(
+    (one): one is Card => one !== null,
   )
+
+  let rowsAbove = notice === null ? 0 : 1
+
+  for (const one of cards) {
+    rowsAbove += one.rows
+  }
+
+  const logRows = logRowsFor(frame, rowsAbove)
+
+  return {
+    tree: (
+      <Box flexDirection="column" width={frame.columns}>
+        {notice}
+        {cards.map(one => one.element)}
+        {activityCard(kit, log, frame, logRows).element}
+      </Box>
+    ),
+    logTop: rowsAbove,
+    logRows,
+  }
 }

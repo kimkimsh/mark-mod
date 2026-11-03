@@ -76,7 +76,7 @@ Each bar is a fuel gauge: its length is the amount **left**, and the number besi
 - **5-hour** and **Weekly**: how much of your subscription usage limits is left, and when each resets.
 - `runs out in 1h 35m at this pace`: at the rate you have used this window so far, it will run out before it resets. This is a straight-line projection, and it is not made in the first 15 minutes of a 5-hour window or the first two days of a week.
 
-Colours: grey while there is plenty left; yellow at 40% left or less, or when a limit is on pace to run out; red with a `⚠` at 15% left or less.
+Colours: the bar is green while there is plenty left. Bar and number turn yellow at 40% left or less, or when a limit is on pace to run out, and red with a `⚠` at 15% left or less.
 
 Other values you may see:
 
@@ -89,7 +89,7 @@ When the terminal is too narrow for everything, the row gives way in this order:
 
 ### Row 3: what is running
 
-Running subagents, working teammates and background tasks, each with how long it has run:
+Running subagents, working teammates and background tasks, each with how long it has run. The group names are coloured by kind, the same colours the pane uses:
 
 ```
   Subagents   Find callers of buildView (haiku, low effort) 40s     Background   npm test 20s
@@ -99,38 +99,75 @@ A subagent is named by the task it was given; a teammate by its name. In bracket
 
 ## The dashboard pane
 
+The pane is a column of cards. The first three show where the session stands; the last, **Activity**, is a running log of what happened, and fills whatever height is left.
+
 ```
-Model       Haiku 5.5, medium effort
-Last reply  just now, took 3s, edited 2 files, used 1 subagent
-
-Context     ███████████████▌ 88% left   117k of 1M used, compacted once
-5-hour      ████████▊░░░░░░░ 55% left   resets in 2h 14m
-Weekly      ███████████████▍ 96% left   resets in 6d 17h
-
-Cost        $0.21
-Tokens      1.34M   main 945k, agents 393k
-            input 32, output 4.4k
-            cache read 1.07M, cache write 267k
-
-Subagents  1 running, 3 done
-● Explore         Find callers of buildView                          40s
-                  Haiku 5.5, low effort   reading model.ts   48k context
-
-Background  1 running
-● shell           Sleep 40 seconds in background                     25s
+╭──────────────────────────────────────────────────────────╮
+│ ● Working  reading model.ts                              │
+│ Model       Haiku 5.5, medium effort                     │
+│ Last reply  4m ago, took 3s, edited 2 files              │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Context     ████████▊░ 88% left   117k of 1M used        │
+│ 5-hour      █████▍░░░░ 55% left   resets in 2h 14m       │
+│ Weekly      █████████▎ 92% left   resets in 6d 16h       │
+│ Cost        $0.21                                        │
+│ Tokens      ████████▉█ 1.34M   main 945k, agents 393k    │
+│             input 32, output 4.4k                        │
+│             cache read 1.07M, cache write 267k           │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Subagents  1 running, 3 done                             │
+│ ● Explore         Find callers of buildView          40s │
+│                   Haiku 5.5, low effort   reading model… │
+│ Background  1 running                                    │
+│ ● shell           Sleep 30 seconds in background     25s │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Activity                                 3 earlier above │
+│ 02:44:03  you         Do these in order: 1) run python3… │
+│ 02:44:07  shell       started: Sleep 30 seconds in back… │
+│ 02:44:08  Explore     started: Find callers of buildView │
+│ 02:44:09  Claude      reading model.ts                   │
+│ 02:44:11  Claude    ✕ failed: running false              │
+│ 02:44:12  Explore   ✓ done in 4s: Find callers of build… │
+│ 02:44:12  Claude    ✓ replied in 9s, used 1 subagent     │
+╰──────────────────────────────────────────────────────────╯
 ```
 
-- **Model**: the model and effort the main conversation runs on.
-- **Last reply**: when the last reply ended, how long it took, and what it did.
-- **Context** and the limits: the gauges in full, with how many tokens the context holds and how many times this conversation was compacted.
-- **Cost** and **Tokens**: the session's cost and token total, split into the main conversation and its agents, and into input, output, cache read and cache write.
-- **Subagents**, **Teammates**, **Background**: one row per running item with its age. A working agent has a second line: its model and effort, what it is doing now, and how full its context is. Finished subagents are counted in the heading (`3 done`). A group with nothing in it is left out.
+- **State card**: the band's state, then the model and effort the main conversation runs on, and what the last reply did. Its border takes the state's colour while something runs or needs you, and turns grey at rest.
+- **Usage card**: the gauges in full, with how many tokens the context holds and how many times the conversation was compacted; then cost and tokens. The tokens bar splits the total into the main conversation (orange) and its agents (blue), the same colours as the words after it. The card's border turns yellow or red with the worst gauge.
+- **Agents card**: one row per running subagent, teammate or background task with its age. A working agent has a second line: its model and effort, what it is doing now, and how full its context is. Finished subagents are counted in the heading (`3 done`). The card is left out while there are none.
+- **Activity card**: one line per event, newest at the bottom, each with the time it happened and who it was about.
+
+### The Activity log
+
+| Line | When |
+|---|---|
+| `you` and the first line of your prompt | you send a prompt (from the terminal or Remote Control) |
+| `Claude` and what a tool is doing | the main conversation starts a tool call |
+| an agent's name and what its tool is doing | a subagent or teammate starts a tool call |
+| `started: …`, `resumed: …` | a subagent, teammate or background task starts; a subagent resumes or a teammate is brought back |
+| `✓ done in 40s: …`, `✕ failed after 2s: …`, `■ stopped after 1m: …` | an agent or background task ends (`ended after …` when nothing said how) |
+| `✕ failed: …` | a tool call reports an error |
+| `■ interrupted: …`, `■ declined: …`, `■ denied: …` | you interrupt a tool call, turn down a question or a plan, or a hook refuses a call |
+| `✓ replied in 9s, edited 2 files` | a reply ends (`■ interrupted after …`, `✕ ended with an error after …` when it did not) |
+| `session` `compacted the conversation` | a compaction ran |
+
+Names are coloured by who they are about: you in bold, Claude in orange, subagents in blue, teammates in purple, background tasks in teal. Outcomes carry a mark in their own column, so a failure stands out while you scroll.
+
+A background task's line says how it ended once its notification arrives, which can be after the reply that started it has finished. A permission prompt you answer with no reads as `failed`, because Claude Code reports it the same way as a tool error.
+
+**Scrolling:** turn the mouse wheel over the pane. The log moves back through older lines and stays there while new ones arrive; its header then says `3 newer below`. Scroll back to the bottom, or let the log grow tall enough to show the newest line, and it follows new lines again. With the pane focused, Page Up and Page Down move it one screen of lines. The log keeps the last 200 lines, and `/clear` starts it over.
+
+Docked beside the conversation (fullscreen), the pane fills the window's height and the log takes the rows the other cards leave. Above the prompt (not fullscreen), the log shows its last six lines.
 
 ## Good to know
 
 - **What a reply "did":** `edited 3 files` counts the different files changed by Edit, Write or NotebookEdit during that reply, by the main conversation or by subagents that reply started. A file edited twice counts once. `used 2 subagents` counts the subagents that reply started, including ones they started themselves. Teammates are not counted, because they join the session rather than doing one reply's work; neither are a workflow's agents, which work for the workflow running in the background. A subagent left running in the background after an earlier reply does not add to a later one.
+- **Times** in the Activity log are your computer's local time.
 - **Tokens** add up every API request made after the mod loaded, for the main conversation and all agents: input, output, cache read and cache write. Cache reads are counted because they are tokens the session used; since every request re-reads the cached conversation, the total grows quickly as a conversation gets long.
-- Reopening a session with `claude --resume`, or switching to another with `/resume`, continues that session's saved count. `/clear` starts a new session, so the count, the last reply and the compaction count start again; the model and the limit gauges stay.
+- Reopening a session with `claude --resume`, or switching to another with `/resume`, continues that session's saved count. `/clear` starts a new session, so the count, the last reply, the compaction count and the Activity log start again; the model and the limit gauges stay.
 - An agent's or task's age counts from when the mod first saw it.
 - **Background** is work the main conversation started while the mod was loaded. A command or monitor that a subagent or teammate starts shows on that agent's row instead, as waiting, because only that agent hears when it ends.
 - **Compactions** are counted only where Claude Code tells the mod about them. Where an organization manages Claude Code (a Team or Enterprise account), it does not, and the pane says nothing about compactions rather than a wrong number.

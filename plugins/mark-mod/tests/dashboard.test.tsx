@@ -10,6 +10,8 @@ const SESSION_ID = 'session-1'
 
 const START = 1_800_000_000_000
 
+const PANE_BODY_ROWS = 40
+
 const SURFACES = ['terminal', 'desktop'] as const
 
 type World = {
@@ -115,15 +117,28 @@ async function bandText($: Engine, isWorking: boolean, columns: number): Promise
 }
 
 async function paneText($: Engine, columns: number): Promise<string> {
-  const ui = await $.ui.mount({
+  const ui = await mountPane($, columns, PANE_BODY_ROWS, 'dock')
+
+  const text = (await ui.find({ type: 'Box' }))?.text ?? ''
+  await ui.unmount()
+
+  return text
+}
+
+async function mountPane($: Engine, columns: number, bodyRows: number, placement: 'dock' | 'inline') {
+  return $.ui.mount({
     plugin: PLUGIN,
     surface: 'terminal',
     component: 'Pane',
     requestId: PANE_ID,
-    props: { title: 'Session', isFocused: false, bodyColumns: columns, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+    props: { title: 'Session', isFocused: false, bodyColumns: columns, placement, scroll: { offset: 0, bodyRows }, view: {} },
   })
+}
 
-  const text = (await ui.find({ type: 'Box' }))?.text ?? ''
+// One card of the pane, by its key: session, usage, agents or activity.
+async function paneCardText($: Engine, columns: number, key: string): Promise<string> {
+  const ui = await mountPane($, columns, PANE_BODY_ROWS, 'dock')
+  const text = (await ui.find({ key }))?.text ?? ''
   await ui.unmount()
 
   return text
@@ -230,6 +245,9 @@ const FIVE_HOUR_READING: RateLimitReading = { kind: 'five_hour', percentUsed: 33
 
 const WEEKLY_RESETS_AT = new Date(START + 6 * 86_400_000).toISOString()
 
+// The stored clock moves in 30-second steps while nothing runs.
+const RESET_SOON_MS = 30_000
+
 const MEASURED: SessionUsage = {
   startedAt: START,
   context: { tokens: 92_100, window: 200_000, percent: 46 },
@@ -317,11 +335,15 @@ describe('band', () => {
     expect(text).toContain('Context not measured yet')
   })
 
+  // The reset lies one idle-clock step ahead rather than hours: every second
+  // the clock moves runs the one-second tick, and hours of them outlast the
+  // test's time on a busy machine.
   test('a window whose reset time passed stops claiming its old reading', async ($, on) => {
     const world = boot(on, SESSION_ID)
+    const resetsSoon = { ...FIVE_HOUR_READING, resetsAt: new Date(START + RESET_SOON_MS).toISOString() }
     await start($)
-    await measure($, world, MEASURED)
-    await world.clock.advance(2 * 3_600_000 + 1_000)
+    await measure($, world, { ...MEASURED, rateLimits: [resetsSoon] })
+    await world.clock.advance(RESET_SOON_MS + 1_000)
 
     expect(await bandText($, false, 140)).toContain('updates on next reply')
   })
@@ -1195,7 +1217,8 @@ describe('pane', () => {
     const after = await paneText($, 90)
 
     expect(after).toContain('Haiku 5.5, low effort   48k context')
-    expect(after).not.toContain('reading model.ts')
+    expect(await paneCardText($, 90, 'agents')).not.toContain('reading model.ts')
+    expect(await paneCardText($, 90, 'activity')).toContain('Explore  reading model.ts')
   })
 
   test('the session\'s model comes from its main turn alone, and stays across /clear', async ($, on) => {
@@ -1312,5 +1335,311 @@ describe('pane', () => {
 
     reading.open()
     await call
+  })
+})
+
+// The activity card's text, rows run together: each entry's time, then who,
+// then its outcome mark ("  " for a plain step) and text.
+function activityText($: Engine): Promise<string> {
+  return paneCardText($, 90, 'activity')
+}
+
+function earlierCount(text: string): number {
+  return Number(/(\d+) earlier above/.exec(text)?.[1] ?? 0)
+}
+
+// Reads f<first>.ts onward, one logged call each.
+async function readFiles($: Engine, first: number, count: number): Promise<void> {
+  for (let index = first; index < first + count; index++) {
+    await $.tool.call({ tool: 'Read', tool_use_id: `r${index}`, file_path: `/w/f${index}.ts` })
+  }
+}
+
+async function cardOf(ui: Awaited<ReturnType<typeof mountPane>>, key: string): Promise<string> {
+  return (await ui.find({ key }))?.text ?? ''
+}
+
+async function logCard($: Engine, bodyRows: number, placement: 'dock' | 'inline'): Promise<string> {
+  const ui = await mountPane($, 90, bodyRows, placement)
+  const text = await cardOf(ui, 'activity')
+  await ui.unmount()
+
+  return text
+}
+
+describe('activity log', () => {
+  test('a reply logs the prompt, each call, a denied call and how it ended, in order', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+    on('tool.call', { tool: 'Bash' }, () => ({ deny: 'blocked by policy' }))
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await $.prompt.submit({ text: 'fix the band colours\nand the pane', wait: false, origin: { kind: 'composer' } })
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/w/a.ts' })
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test' })
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/w/a.ts', old_string: 'a', new_string: 'b' })
+    await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
+    const text = await activityText($)
+
+    const order = [
+      'you  fix the band colours',
+      'Claude  reading a.ts',
+      'Claude  running npm test',
+      'Claude■ denied: running npm test',
+      'Claude  editing a.ts',
+      'Claude✓ replied in 5s, edited 1 file',
+    ].map(entry => text.indexOf(entry))
+
+    expect(order.every(index => index >= 0)).toBe(true)
+    expect(order).toEqual([...order].sort((a, b) => a - b))
+    expect(text).not.toContain('and the pane')
+  })
+
+  test('a notification is not the person\'s prompt', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+    await start($)
+    await $.prompt.submit({ text: 'scheduled check', wait: false, origin: { kind: 'scheduled-trigger' } })
+
+    expect(await activityText($)).toContain('Nothing yet.')
+  })
+
+  test('agents and background tasks log their start and their end', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+    on('tool.call', () => ({ result: { ...DONE, backgroundTaskId: 'bg-1' } }))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+    await start($)
+    await $.agent.spawn(EXPLORE_SPAWN)
+    world.agents = [EXPLORER]
+    await world.clock.advance(1_000)
+    world.agents = [{ ...EXPLORER, status: 'completed' }]
+    await world.clock.advance(1_000)
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
+    await world.clock.advance(2_000)
+    await $.prompt.submit({
+      text: '<task-notification><task-id>bg-1</task-id><status>failed</status></task-notification>',
+      wait: false,
+      origin: { kind: 'task-notification' },
+    })
+    const text = await activityText($)
+
+    expect(text).toContain('Explore  started: list files')
+    expect(text).toContain('Explore✓ done in 1s: list files')
+    expect(text).toContain('shell  started: npm test')
+    expect(text).toContain('shell✕ failed after 2s: npm test')
+  })
+
+  test('/clear starts the log over', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 2)
+
+    expect(await activityText($)).toContain('reading f1.ts')
+
+    await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+
+    expect(await activityText($)).toContain('Nothing yet.')
+  })
+
+  test('docked, the log takes the rows the other cards leave; inline it keeps to six', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 40)
+
+    const short = await logCard($, 30, 'dock')
+    const tall = await logCard($, 40, 'dock')
+    const above = await logCard($, 40, 'inline')
+
+    expect(earlierCount(short) - earlierCount(tall)).toBe(10)
+    expect(earlierCount(above)).toBe(40 - 6)
+    expect(above).toContain('reading f39.ts')
+  })
+
+  test('scrolling back holds the log; scrolling to the end follows it again', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 20)
+    const ui = await mountPane($, 90, 18, 'dock')
+    const scroll = { component: 'Pane', requestId: PANE_ID, offset: 0, bodyRows: 18, contentRows: 18, origin: { kind: 'person' } } as const
+
+    await $.ui.scroll({ ...scroll, by: -3 })
+    await readFiles($, 20, 1)
+    const held = await cardOf(ui, 'activity')
+
+    expect(held).toContain('4 newer below')
+    expect(held).toContain('reading f16.ts')
+    expect(held).not.toContain('reading f17.ts')
+    expect(held).not.toContain('reading f20.ts')
+
+    await $.ui.scroll({ ...scroll, by: 100 })
+    const following = await cardOf(ui, 'activity')
+
+    expect(following).not.toContain('newer below')
+    expect(following).toContain('reading f20.ts')
+    await ui.unmount()
+  })
+
+  test('a held log that shows the newest entry anyway follows again', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 12)
+    const short = await mountPane($, 90, 18, 'dock')
+    await $.ui.scroll({ component: 'Pane', requestId: PANE_ID, offset: 0, bodyRows: 18, contentRows: 18, origin: { kind: 'person' }, by: -3 })
+    await short.unmount()
+
+    const tall = await mountPane($, 90, PANE_BODY_ROWS, 'dock')
+    await readFiles($, 12, 30)
+    const text = await cardOf(tall, 'activity')
+    await tall.unmount()
+
+    expect(text).not.toContain('newer below')
+    expect(text).toContain('reading f41.ts')
+  })
+
+  test('a page key moves the log one window, not the body\'s rows', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 40)
+    const ui = await mountPane($, 90, 18, 'dock')
+    await $.ui.scroll({ component: 'Pane', requestId: PANE_ID, offset: 0, bodyRows: 18, contentRows: 18, origin: { kind: 'person' }, by: -18 })
+    const text = await cardOf(ui, 'activity')
+    await ui.unmount()
+
+    const shown = text.match(/reading f\d+\.ts/g)?.length ?? 0
+
+    expect(Number(/(\d+) newer below/.exec(text)?.[1])).toBe(shown)
+  })
+
+  test('each surface scrolls by its own drawing', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await readFiles($, 0, 40)
+
+    const terminal = await mountPane($, 90, 18, 'dock')
+
+    const desktop = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: PANE_ID,
+      props: { title: 'Session', isFocused: false, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: PANE_BODY_ROWS }, view: {} },
+    })
+
+    const wheel = { column: 10, row: 10 }
+    await $.ui.scroll({ component: 'Pane', requestId: PANE_ID, offset: 0, bodyRows: 18, contentRows: 18, origin: { kind: 'person' }, by: -100, pointer: wheel })
+    const text = await cardOf(terminal, 'activity')
+    await terminal.unmount()
+    await desktop.unmount()
+
+    expect(text).toContain('reading f0.ts')
+  })
+
+  test('a call before the list names its agent goes under the name the team gave it', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1', teammateId: 'scout-2@session-1' }))
+    on('tool.call', () => ({ result: DONE }))
+    await start($)
+    await $.agent.spawn({ ...EXPLORE_SPAWN, name: 'scout', isTeammate: true })
+    await $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/w/a.ts', ...IN_AGENT })
+    await $.agent.spawn({ ...EXPLORE_SPAWN, name: 'scout', isTeammate: true, resume: { agentId: 'a1' } })
+    const text = await activityText($)
+
+    expect(text).toContain('scout-2  started: list files')
+    expect(text).toContain('scout-2  reading a.ts')
+    expect(text).toContain('scout-2  resumed: list files')
+  })
+
+  test('an agent that ended before any pull saw it running still logs its end', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+    await start($)
+    await $.agent.spawn(EXPLORE_SPAWN)
+    world.agents = [{ ...EXPLORER, status: 'failed' }]
+    await world.clock.advance(1_000)
+
+    expect(await activityText($)).toContain('Explore✕ failed after')
+  })
+
+  test('a turned-down plan is declined, and a failed command failed', async ($, on) => {
+    boot(on, SESSION_ID)
+    on('tool.call', () => ({ isError: true, result: 'no', text: 'no' }))
+    await start($)
+    await $.tool.call({ tool: 'ExitPlanMode', tool_use_id: 'plan-1' })
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test' })
+    const text = await activityText($)
+
+    expect(text).toContain('Claude■ declined: presenting a plan')
+    expect(text).toContain('Claude✕ failed: running npm test')
+  })
+
+  test('a task the Stop snapshot took down ends by its notification, or at the next Stop', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    let taskId = 'bg-1'
+    on('classic.Stop', () => ({}))
+    on('tool.call', () => ({ result: { ...DONE, backgroundTaskId: taskId } }))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+    await start($)
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test', run_in_background: true })
+    await world.clock.advance(2_000)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+
+    expect(await bandText($, false, 140)).not.toContain('Background')
+    expect(await activityText($)).not.toContain('npm test after')
+
+    await $.prompt.submit({
+      text: '<task-notification><task-id>bg-1</task-id><status>failed</status></task-notification>',
+      wait: false,
+      origin: { kind: 'task-notification' },
+    })
+
+    expect(await activityText($)).toContain('shell✕ failed after 2s: npm test')
+
+    taskId = 'bg-2'
+    await $.tool.call({ tool: 'Bash', tool_use_id: 'b2', command: 'npm run lint', run_in_background: true })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+    await world.clock.advance(1_000)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+
+    expect(await activityText($)).toContain('shell  ended after 1s: npm run lint')
+  })
+
+  test('a dead pane\'s teammate ends once, even while tmux cannot be asked', async ($, on) => {
+    const world = boot(on, SESSION_ID)
+    const tmux = fakeTmux(on, world, undefined)
+    await start($)
+    world.agents = [PANE_TEAMMATE]
+    await world.clock.advance(1_000)
+    tmux.listing = { exitCode: 0, stdout: '%0 0\n%5 1\n' }
+    await world.clock.advance(1_000)
+    tmux.listing = null
+    await world.clock.advance(1_000)
+
+    expect(await bandText($, false, 140)).not.toContain('Waiting on')
+
+    tmux.listing = { exitCode: 0, stdout: '%0 0\n%5 1\n' }
+    await world.clock.advance(1_000)
+
+    expect((await activityText($)).match(/stopped after/g)?.length).toBe(1)
+  })
+
+  test('the pane\'s state is the engine\'s word once the band has it', async ($, on) => {
+    boot(on, SESSION_ID)
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'turn-1' })
+
+    expect(await paneCardText($, 90, 'session')).toContain('Working')
+
+    const ui = await band($, 'terminal', false, 140, 5)
+
+    expect(await paneCardText($, 90, 'session')).not.toContain('Working')
+    await ui.unmount()
   })
 })
